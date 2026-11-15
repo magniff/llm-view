@@ -63,7 +63,7 @@ await test('greedy chat replies match HF', () => {
     call('chat_send', { text: c.user });
     const ids = [];
     for (;;) {
-      const r = call('chat_step', { n: 8, temperature: 0, repeat_penalty: 1 });
+      const r = call('chat_step', { n: 8, temperature: 0, repeat_penalty: 1, dry: 0 });
       ids.push(...r.tokens.map((t) => t.id));
       if (r.done || ids.length >= c.reply_ids.length) break;
     }
@@ -73,7 +73,7 @@ await test('greedy chat replies match HF', () => {
 
 await test('decode after prefill is bit-identical to a full prefill', () => {
   call('run', { text: 'The capital of France is' });
-  const a = call('step', { n: 4, temperature: 0, repeat_penalty: 1 });
+  const a = call('step', { n: 4, temperature: 0, repeat_penalty: 1, dry: 0 });
   const b = call('run', { ids: a.tokens.map((t) => t.id) });
   assert.deepEqual(b.next, a.next);
 });

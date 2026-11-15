@@ -22,7 +22,7 @@ fn ok(s: &mut Session, method: &str, args: Value) -> Value {
     s.call(method, &args).unwrap_or_else(|e| panic!("{method}: {e}"))
 }
 
-const GREEDY: fn() -> Value = || json!({"temperature": 0.0, "repeat_penalty": 1.0});
+const GREEDY: fn() -> Value = || json!({"temperature": 0.0, "repeat_penalty": 1.0, "dry": 0.0}); // HF greedy: no penalties
 
 /// Generate a whole chat reply greedily; returns (token ids, stop reason).
 fn reply(s: &mut Session, max: usize) -> (Vec<u32>, String) {
@@ -252,6 +252,7 @@ fn ablation_round_trips() {
 #[test]
 fn bad_requests_are_errors_not_panics() {
     let mut s = session();
+    let sampler0 = ok(&mut s, "state", json!({}))["sampler"].clone();
     for (m, a) in [
         ("nope", json!({})),
         ("run", json!({})),
@@ -278,13 +279,15 @@ fn bad_requests_are_errors_not_panics() {
         ("step", json!({"top_k": -1})),
         ("step", json!({"temperature": "hot"})),
         ("chat_step", json!({"repeat_penalty": 0})),
+        ("chat_step", json!({"dry": -1})),
+        ("step", json!({"dry": "lots"})),
         ("chat_step", json!({"n": -3})),
     ] {
         assert!(s.call(m, &a).is_err(), "{m} {a} should be an error");
     }
     // A rejected request leaves the settings alone.
     let st = ok(&mut s, "state", json!({}));
-    assert_eq!(st["sampler"]["repeat_penalty"].as_f64().unwrap() as f32, 1.1);
+    assert_eq!(st["sampler"], sampler0, "rejected requests must not change the sampler");
     let before = st["tokens"].as_array().unwrap().len();
     assert!(s.call("step", &json!({"n": 3, "force": 49152, "temperature": 0.0})).is_err());
     let st = ok(&mut s, "state", json!({}));

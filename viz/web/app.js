@@ -205,6 +205,7 @@ function samp() {
     top_p: numIn('#topp', 1, 0, 1),
     top_k: Math.floor(numIn('#topk', 0, 0, 1e6)),
     repeat_penalty: numIn('#rep', 1, 0.01, 100),
+    dry: numIn('#dry', 0, 0, 100),
   };
 }
 
@@ -865,11 +866,16 @@ async function viewKV() {
 // ---------------------------------------------------------------- next token
 
 function samplingDist(top, lse) {
-  const s = samp();
-  const recent = new Set(S.st.tokens.slice(-64).map((t) => t.id));
+  const s = samp(), cfg = S.st.sampler;
+  const recent = new Set(S.st.tokens.slice(-cfg.repeat_window).filter((t) => !t.special).map((t) => t.id));
+  // DRY: the engine reports, per token, the length of the repeat it would extend;
+  // the penalty for the slider's strength is computed here, so dragging is live.
+  const dryLen = new Map(S.st.next.dry || []);
   let cand = top.map(([id, text, l]) => {
     if (s.repeat_penalty !== 1 && recent.has(id)) l = l > 0 ? l / s.repeat_penalty : l * s.repeat_penalty;
-    return { id, text, raw: Math.exp(top.find((x) => x[0] === id)[2] - lse), l };
+    const len = dryLen.get(id);
+    const dry = len && s.dry > 0 ? s.dry * cfg.dry_base ** (len - cfg.dry_allowed_len) : 0;
+    return { id, text, raw: Math.exp(top.find((x) => x[0] === id)[2] - lse), l: l - dry, dry, len };
   });
   cand.sort((a, b) => b.l - a.l);
   if (s.temperature <= 0) return cand.map((c, i) => ({ ...c, p: i === 0 ? 1 : 0 }));
@@ -900,21 +906,23 @@ async function viewNext() {
       el('div', { class: 'barcell' },
         el('div', { class: 'bar', style: `width:${Math.max(1, d.raw * 420)}px`, title: 'model probability' }),
         el('div', { class: 'bar alt', style: `width:${Math.max(d.p > 0 ? 1 : 0, d.p * 420)}px`, title: 'after sampling settings' })),
-      el('span', { text: `${pct(d.raw)} → ${d.p > 0 ? pct(d.p) : '0'}` }),
+      el('span', {}, `${pct(d.raw)} → ${d.p > 0 ? pct(d.p) : '0'}`,
+        d.dry ? el('span', { class: 'drytag', title: `this token would repeat a ${d.len}-token sequence that already appeared; DRY lowers its logit by ${d.dry.toFixed(2)}`, text: `↺ ${d.len} −${d.dry.toFixed(1)}` }) : null),
     ];
     row[0].onclick = () => act(async () => setState(await call('step', { n: 1, force: d.id, ...samp() }), 'last'));
     return row;
   });
   return [
     explain('The final layer produces one logit per vocabulary entry; softmax turns them into the ', B('model\'s distribution'), ' (blue). ',
-      'Sampling settings then reshape it (orange): temperature divides the logits, top-k and top-p cut the tail, and the repetition penalty pushes down recently used tokens. ',
+      'Sampling settings then reshape it (orange): temperature divides the logits, top-k and top-p cut the tail, the repetition penalty pushes down recently used tokens, and ',
+      B('DRY'), ' (↺) pushes down a token that would continue a sequence the text already contains, harder the longer the repeat: the loop-breaker a model this small badly needs. ',
       'Change the settings above and watch the orange bars move. Click a token to force it as the next token: an intervention on the sampler, not the model.'),
     el('div', { class: 'kpi' },
       el('div', {}, el('b', { text: JSON.stringify(toks[toks.length - 1].text) }), `last token (position ${toks.length - 1})`),
       el('div', {}, el('b', { text: pct(covered) }), 'of probability mass in the top 50 shown'),
       el('div', {}, el('b', { text: lse.toFixed(2) }), 'log Σ exp(logits)')),
     el('div', { class: 'bars' }, rows),
-    el('p', { class: 'dim', style: 'font-size:12px', text: 'Rows are sorted by the adjusted score, so tokens hit by the repetition penalty can sit below less likely ones. Orange is renormalized over the top 50 tokens, a close approximation unless the temperature is very high.' }),
+    el('p', { class: 'dim', style: 'font-size:12px', text: 'Rows are sorted by the adjusted score, so tokens hit by a penalty can sit below less likely ones. ↺ n −x: would extend an n-token repeat, logit lowered by x. Orange is renormalized over the top 50 tokens, a close approximation unless the temperature is very high.' }),
   ];
 }
 
@@ -982,6 +990,7 @@ function chatSamp() {
     temperature: numIn('#c-temp', 0, 0),
     top_p: numIn('#c-topp', 1, 0, 1),
     repeat_penalty: numIn('#c-rep', 1, 0.01, 100),
+    dry: numIn('#c-dry', 0, 0, 100),
   };
 }
 
@@ -1094,6 +1103,7 @@ async function refreshChat() {
   setRange('#c-temp', s.temperature);
   setRange('#c-topp', s.top_p);
   setRange('#c-rep', s.repeat_penalty);
+  setRange('#c-dry', s.dry);
   if (!$('#c-system').value) $('#c-system').value = C.st.system;
   renderChatSide();
   // Bubbles are built incrementally while chatting; only the raw view is redrawn from state.
@@ -1200,7 +1210,8 @@ function setupChat() {
     el('div', { class: 'knobs stack' },
       knob('c-temp', 'temperature', 0, 2, 0.05, 0.2, 'Divide the logits by this before softmax. 0 = always the top token', { zero: 'greedy' }),
       knob('c-topp', 'top-p', 0, 1, 0.01, 0.9, 'Keep the smallest set of tokens whose probabilities add up to p', { max: 'off' }),
-      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1.1, 'Push down tokens used in the last 64 positions', { min: 'off' })),
+      knob('c-dry', 'anti-loop (DRY)', 0, 2, 0.05, 0.8, 'Push down a token that would continue a sequence that already appeared, harder the longer the repeat', { zero: 'off' }),
+      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1.0, 'Push down tokens used in the last 64 positions', { min: 'off' })),
     el('h3', { text: 'system prompt' }),
     el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false' }),
     el('button', { class: 'wide', text: 'New chat', title: 'clear the conversation (applies the system prompt)', onclick: () => newChat() }));
@@ -1220,7 +1231,7 @@ $('#run').onclick = () => act(async () => setState(await call('run', { text: $('
 $('#step').onclick = () => act(async () => setState(await call('step', { n: 1, ...samp() }), 'last'));
 $('#gen').onclick = () => act(async () => setState(await call('step', { n: 16, ...samp() }), 'last'));
 $('#prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('#run').click(); } });
-for (const id of ['#temp', '#topp', '#topk', '#rep']) $(id).addEventListener('input', () => { if (S.tab === 'next') renderTab(); });
+for (const id of ['#temp', '#topp', '#topk', '#rep', '#dry']) $(id).addEventListener('input', () => { if (S.tab === 'next') renderTab(); });
 document.addEventListener('keydown', (e) => {
   if (MODE !== 'complete' || !S.st || e.target.matches('textarea, input')) return;
   if (e.key === 'ArrowLeft' && S.sel > 0) S.sel--;
@@ -1249,7 +1260,7 @@ document.addEventListener('keydown', (e) => {
     $('#chat-input').disabled = false;
     const st = await call('state');
     const s = st.sampler;
-    setRange('#temp', s.temperature); setRange('#topp', s.top_p); setRange('#topk', s.top_k); setRange('#rep', s.repeat_penalty);
+    setRange('#temp', s.temperature); setRange('#topp', s.top_p); setRange('#topk', s.top_k); setRange('#rep', s.repeat_penalty); setRange('#dry', s.dry);
     $('#prompt').value = st.tokens.map((t) => t.text).join('');
     setState(st, 'last');
     if (MODE === 'chat') await refreshChat();

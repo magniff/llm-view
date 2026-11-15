@@ -33,7 +33,8 @@ struct Args {
     temp: Option<f32>,
     top_k: usize,
     top_p: f32,
-    repeat_penalty: f32,
+    repeat_penalty: Option<f32>,
+    dry: f32,
     seed: u64,
     max_new: usize,
     ctx: usize,
@@ -41,7 +42,7 @@ struct Args {
 
 fn parse_args() -> engine::Result<Args> {
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
-    let mut a = Args { complete: false, model: None, size: "360m".into(), system: None, temp: None, top_k: 0, top_p: 0.9, repeat_penalty: 1.1, seed, max_new: 1024, ctx: 2048 };
+    let mut a = Args { complete: false, model: None, size: "360m".into(), system: None, temp: None, top_k: 0, top_p: 0.9, repeat_penalty: None, dry: 0.8, seed, max_new: 1024, ctx: 2048 };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -53,13 +54,14 @@ fn parse_args() -> engine::Result<Args> {
             "--temp" => a.temp = Some(val()?.parse()?),
             "--top-k" => a.top_k = val()?.parse()?,
             "--top-p" => a.top_p = val()?.parse()?,
-            "--repeat-penalty" => a.repeat_penalty = val()?.parse()?,
+            "--repeat-penalty" => a.repeat_penalty = Some(val()?.parse()?),
+            "--dry" => a.dry = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
             "-n" | "--max-new" => a.max_new = val()?.parse()?,
             "--ctx" => a.ctx = val()?.parse()?,
             "-h" | "--help" => {
                 println!(
-                    "cargo run -- [--complete] [--size 135m|360m] [--model DIR] [--system TEXT] [--temp T] [--top-k K] [--top-p P]\n     [--seed N] [--repeat-penalty R]\n     [-n MAX_NEW_TOKENS (default 1024)] [--ctx CONTEXT_LEN]\n\n{HELP}"
+                    "cargo run -- [--complete] [--size 135m|360m] [--model DIR] [--system TEXT] [--temp T] [--top-k K] [--top-p P]\n     [--seed N] [--repeat-penalty R] [--dry STRENGTH (0.8; 0 = off)]\n     [-n MAX_NEW_TOKENS (default 1024)] [--ctx CONTEXT_LEN]\n\n{HELP}"
                 );
                 std::process::exit(0);
             }
@@ -118,21 +120,29 @@ fn main() -> engine::Result<()> {
     let t = std::time::Instant::now();
     let model = Model::load(&dir)?;
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json"))?;
-    // Chat models: 0.2 / top-p 0.9 is what SmolLM2's authors suggest. Completion: a bit livelier.
+    // Chat: the model card's settings (0.2 / top-p 0.9). Completion: a bit livelier.
+    // Both use DRY against loops rather than a repetition penalty, which also
+    // punishes words an answer has to repeat.
     let temp = a.temp.unwrap_or(if a.complete { 0.8 } else { 0.2 });
-    let mut sampler = Sampler::new(temp, a.top_k, a.top_p, a.seed);
-    sampler.repeat_penalty = a.repeat_penalty;
+    let specials: Vec<u32> = tok.specials.iter().map(|&(_, id)| id).collect();
+    let mut sampler = Sampler::new(temp, a.top_k, a.top_p, a.seed)
+        .with_dry(model.cfg.vocab, |id| specials.contains(&id) || Sampler::dry_breaker_bytes(&tok.decode_bytes(&[id])));
+    sampler.dry_multiplier = a.dry;
+    sampler.repeat_penalty = a.repeat_penalty.unwrap_or(1.0);
+    // Never penalize control tokens: every chat prompt contains <|im_end|>.
+    sampler.no_penalty = specials;
     let stop: Vec<u32> = [model.cfg.eos_token, 0].into_iter().collect(); // EOS and <|endoftext|>
 
     eprintln!(
-        "{DIM}{} · {:.1}M params · loaded in {:.0?} · {} mode · temp {temp} top-p {} top-k {} repeat-penalty {}\n{HELP}{RESET}",
+        "{DIM}{} · {:.1}M params · loaded in {:.0?} · {} mode · temp {temp} top-p {} top-k {} repeat-penalty {} dry {}\n{HELP}{RESET}",
         dir.rsplit('/').next().unwrap_or(&dir),
         model.n_params() as f64 / 1e6,
         t.elapsed(),
         if a.complete { "completion" } else { "chat" },
         a.top_p,
         a.top_k,
-        a.repeat_penalty,
+        sampler.repeat_penalty,
+        sampler.dry_multiplier,
     );
 
     let mut conv = Conversation::new(&model, &tok, a.system.as_deref(), a.ctx);

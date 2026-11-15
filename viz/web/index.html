@@ -42,7 +42,8 @@
         <div class="knob" title="Divide the logits by this before softmax. 0 = always the top token"><span>temperature</span><input id="temp" type="range" min="0" max="2" step="0.05" value="0.7"><output data-zero="greedy"></output></div>
         <div class="knob" title="Keep the smallest set of tokens whose probabilities add up to p"><span>top-p</span><input id="topp" type="range" min="0" max="1" step="0.01" value="0.9"><output data-max="off"></output></div>
         <div class="knob" title="Keep only the k most likely tokens. 0 = no limit"><span>top-k</span><input id="topk" type="range" min="0" max="100" step="1" value="0"><output data-zero="off"></output></div>
-        <div class="knob" title="Logits of tokens seen in the last 64 positions are pushed down by this factor"><span>repeat penalty</span><input id="rep" type="range" min="1" max="2" step="0.01" value="1.1"><output data-min="off"></output></div>
+        <div class="knob" title="DRY: push down a token that would continue a sequence that already appeared, harder the longer the repeat. Stops loops without punishing single repeated words"><span>anti-loop (DRY)</span><input id="dry" type="range" min="0" max="2" step="0.05" value="0.8"><output data-zero="off"></output></div>
+        <div class="knob" title="Logits of tokens seen in the last 64 positions are pushed down by this factor"><span>repeat penalty</span><input id="rep" type="range" min="1" max="2" step="0.01" value="1"><output data-min="off"></output></div>
       </div>
     </div>
   </section>

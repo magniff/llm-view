@@ -205,6 +205,8 @@ impl Session {
             "last_op": self.last_op,
             "next": {
                 "lse": next.lse,
+                // [token, length of the repeat it would extend], for the DRY penalty
+                "dry": self.sampler.dry_matches(&self.tokens),
                 "top": next.top.iter().map(|&(id, l)| json!([id, self.text(id), l])).collect::<Vec<_>>(),
             },
             "resid_norm": resid_norm,
@@ -212,7 +214,9 @@ impl Session {
             "mlp_write": self.trace.mlp_write.iter().map(|v| r4v(v)).collect::<Vec<_>>(),
             "ablate": ablate,
             "sampler": {"temperature": self.sampler.temperature, "top_k": self.sampler.top_k,
-                        "top_p": self.sampler.top_p, "repeat_penalty": self.sampler.repeat_penalty},
+                        "top_p": self.sampler.top_p, "repeat_penalty": self.sampler.repeat_penalty,
+                        "dry": self.sampler.dry_multiplier, "dry_base": self.sampler.dry_base,
+                        "dry_allowed_len": self.sampler.dry_allowed_len, "repeat_window": self.sampler.repeat_window},
         })
     }
 
@@ -330,12 +334,17 @@ impl Session {
     /// trace, so keep it modest), `chat_ctx` positions for chat. The inspector
     /// starts out already run on a default prompt.
     pub fn new(model: Model, tok: Tokenizer, name: &str, max_seq: usize, chat_ctx: usize) -> Result<Self, String> {
-        let specials = tok.specials.iter().map(|&(_, id)| id).collect();
-        let mut sampler = Sampler::new(0.7, 0, 0.9, 1234);
-        sampler.repeat_penalty = 1.1;
-        // SmolLM2's suggested chat settings, plus a mild repetition penalty.
-        let mut chat_sampler = Sampler::new(0.2, 0, 0.9, 42);
-        chat_sampler.repeat_penalty = 1.1;
+        let specials: HashSet<u32> = tok.specials.iter().map(|&(_, id)| id).collect();
+        let exempt: Vec<u32> = specials.iter().copied().collect();
+        // Both samplers use DRY against loops (a 135M model falls into them
+        // constantly) instead of the blunt repetition penalty, which also
+        // punishes words an answer has to repeat ("What is 7 + 5?" → "7 + 5 = 12").
+        // Chat otherwise uses the SmolLM2 model card's T 0.2, top-p 0.9.
+        let breaker = |id: u32| specials.contains(&id) || Sampler::dry_breaker_bytes(&tok.decode_bytes(&[id]));
+        let mut sampler = Sampler::new(0.7, 0, 0.9, 1234).with_dry(model.cfg.vocab, breaker);
+        sampler.no_penalty = exempt.clone();
+        let mut chat_sampler = Sampler::new(0.2, 0, 0.9, 42).with_dry(model.cfg.vocab, breaker);
+        chat_sampler.no_penalty = exempt;
         let chat = ChatState {
             cache: model.new_cache(chat_ctx),
             tokens: vec![],
@@ -482,7 +491,7 @@ impl Session {
             "context": self.chat_context(),
             "last_turn": c.last_turn,
             "generating": c.generating,
-            "sampler": {"temperature": s.temperature, "top_k": s.top_k, "top_p": s.top_p, "repeat_penalty": s.repeat_penalty},
+            "sampler": {"temperature": s.temperature, "top_k": s.top_k, "top_p": s.top_p, "repeat_penalty": s.repeat_penalty, "dry": s.dry_multiplier},
         })
     }
 
@@ -586,6 +595,7 @@ fn apply_sampling(s: &mut Sampler, args: &Value, method: &str) -> Result<(), Str
     let t = get("temperature")?;
     let p = get("top_p")?;
     let r = get("repeat_penalty")?;
+    let d = get("dry")?;
     let k = match &args["top_k"] {
         Value::Null => None,
         v => Some(v.as_u64().ok_or_else(|| format!("{method}: 'top_k' must be a non-negative integer"))?),
@@ -599,9 +609,13 @@ fn apply_sampling(s: &mut Sampler, args: &Value, method: &str) -> Result<(), Str
     if r.is_some_and(|r| r <= 0.0) {
         return bad("repeat_penalty", "must be > 0");
     }
+    if d.is_some_and(|d| d < 0.0) {
+        return bad("dry", "must be >= 0 (0 = off)");
+    }
     if let Some(t) = t { s.temperature = t as f32 }
     if let Some(p) = p { s.top_p = p as f32 }
     if let Some(r) = r { s.repeat_penalty = r as f32 }
+    if let Some(d) = d { s.dry_multiplier = d as f32 }
     if let Some(k) = k { s.top_k = usize::try_from(k).unwrap_or(usize::MAX) }
     Ok(())
 }

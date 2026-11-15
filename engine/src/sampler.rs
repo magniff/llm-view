@@ -12,6 +12,15 @@
 //! every token that appeared in the recent window has its logit pushed toward
 //! "less likely" (positive logits ÷ penalty, negative × penalty). Small models
 //! easily fall into loops, repeating a sentence forever, and this breaks them.
+//! But it is blunt: it also punishes the words an answer *must* repeat
+//! ("What is 7 + 5?" → "7 + 5 = 12"), and the punctuation every sentence needs.
+//!
+//! The sharper tool is **DRY** ("don't repeat yourself", from the local-LLM
+//! community: koboldcpp, llama.cpp). It leaves single tokens alone and only
+//! penalizes a token that would *extend a sequence that already occurred*.
+//! If the last L tokens also appeared earlier, followed by token c, then c's
+//! logit drops by `multiplier · base^(L − allowed_len)`: negligible for short
+//! coincidences, crushing for a loop about to repeat a whole sentence.
 
 use crate::ops::softmax;
 
@@ -25,12 +34,40 @@ pub struct Sampler {
     pub repeat_penalty: f32,
     /// How many recent tokens the repetition penalty looks at.
     pub repeat_window: usize,
+    /// Tokens the penalty never touches. Meant for the chat control tokens:
+    /// every prompt contains `<|im_end|>`, and penalizing it makes the model
+    /// reluctant to end its turn, so short answers turn into rambles.
+    pub no_penalty: Vec<u32>,
+    /// DRY strength; 0 = disabled. 0.8 is the usual setting.
+    pub dry_multiplier: f32,
+    /// How fast the DRY penalty grows with the length of the repeat.
+    pub dry_base: f32,
+    /// Repeats up to this many tokens are free.
+    pub dry_allowed_len: usize,
+    /// Tokens that end a DRY match, sorted (newlines, quotes, colons and the
+    /// chat control tokens): structure is supposed to repeat; prose isn't.
+    pub dry_breakers: Vec<u32>,
     rng: u64,
 }
 
+/// Matches longer than this all get the maximum penalty (and the search stops).
+const DRY_MAX_MATCH: usize = 48;
+
 impl Sampler {
     pub fn new(temperature: f32, top_k: usize, top_p: f32, seed: u64) -> Self {
-        Self { temperature, top_k, top_p, repeat_penalty: 1.0, repeat_window: 64, rng: seed }
+        Self {
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty: 1.0,
+            repeat_window: 64,
+            no_penalty: vec![],
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_len: 2,
+            dry_breakers: vec![],
+            rng: seed,
+        }
     }
 
     pub fn greedy() -> Self {
@@ -47,22 +84,112 @@ impl Sampler {
         (z >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// Sample, applying the repetition penalty against `history` (most recent last).
+    /// Turn DRY on with the usual settings. `breaker(id)` says whether a token
+    /// ends a match (call it with the tokenizer: see [`Self::dry_breaker_bytes`]).
+    pub fn with_dry(mut self, vocab: usize, breaker: impl Fn(u32) -> bool) -> Self {
+        self.dry_multiplier = 0.8;
+        self.dry_breakers = (0..vocab as u32).filter(|&id| breaker(id)).collect();
+        self
+    }
+
+    /// The default DRY sequence breakers, as bytes a token may contain.
+    pub fn dry_breaker_bytes(bytes: &[u8]) -> bool {
+        bytes.iter().any(|b| matches!(b, b'\n' | b':' | b'"' | b'*'))
+    }
+
+    /// The penalties [`Self::sample_with_history`] would apply, as
+    /// `(token, logit delta)`: what the visualizer shows as "after penalties".
+    pub fn penalties(&self, logits: &[f32], history: &[u32]) -> Vec<(u32, f32)> {
+        let pen = self.penalized(logits, history);
+        match pen {
+            None => vec![],
+            Some(l) => l.iter().zip(logits).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, b))| (i as u32, a - b)).collect(),
+        }
+    }
+
+    /// Sample, applying the repetition penalty and DRY against `history` (most recent last).
     pub fn sample_with_history(&mut self, logits: &[f32], history: &[u32]) -> u32 {
+        match self.penalized(logits, history) {
+            Some(l) => self.sample(&l),
+            None => self.sample(logits),
+        }
+    }
+
+    /// Logits after the history-based penalties, or None if none apply.
+    fn penalized(&self, logits: &[f32], history: &[u32]) -> Option<Vec<f32>> {
         // A penalty must be a positive factor; 0 or NaN would turn logits into
         // NaN/inf. Anything else is treated as "off" rather than trusted.
         let p = self.repeat_penalty;
-        if p == 1.0 || !(p > 0.0 && p.is_finite()) || history.is_empty() {
-            return self.sample(logits);
+        let rep_on = p != 1.0 && p > 0.0 && p.is_finite();
+        let dry_on = self.dry_multiplier > 0.0 && self.dry_multiplier.is_finite() && self.dry_base >= 1.0;
+        if history.is_empty() || !(rep_on || dry_on) {
+            return None;
         }
         let mut l = logits.to_vec();
+        if rep_on {
+            self.apply_repeat_penalty(&mut l, history);
+        }
+        if dry_on {
+            self.apply_dry(&mut l, history);
+        }
+        Some(l)
+    }
+
+    fn apply_repeat_penalty(&self, l: &mut [f32], history: &[u32]) {
+        let p = self.repeat_penalty;
         let mut seen = std::collections::HashSet::new();
         for &id in history.iter().rev().take(self.repeat_window) {
+            if self.no_penalty.contains(&id) {
+                continue;
+            }
             if let (true, Some(x)) = (seen.insert(id), l.get_mut(id as usize)) {
                 *x = if *x > 0.0 { *x / p } else { *x * p };
             }
         }
-        self.sample(&l)
+    }
+
+    /// For every earlier position e, measure how long the text ending at e
+    /// matches the text ending now (the current suffix). If that match is long
+    /// enough, the token that came after e is what a loop would produce next.
+    /// Returns `(token, longest match)` for each such token, longest first.
+    pub fn dry_matches(&self, h: &[u32]) -> Vec<(u32, usize)> {
+        let n = h.len();
+        let brk = |id: u32| self.dry_breakers.binary_search(&id).is_ok();
+        if n < 2 || brk(h[n - 1]) {
+            return vec![];
+        }
+        let mut longest: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for e in (0..n - 1).rev() {
+            if h[e] != h[n - 1] {
+                continue;
+            }
+            // Overlap is allowed: in "a b a b a b" the match runs through it,
+            // which is exactly how a short loop gets caught.
+            let mut len = 0;
+            while len < DRY_MAX_MATCH && len <= e && h[e - len] == h[n - 1 - len] && !brk(h[e - len]) {
+                len += 1;
+            }
+            if len >= self.dry_allowed_len {
+                let best = longest.entry(h[e + 1]).or_insert(0);
+                *best = (*best).max(len);
+            }
+        }
+        let mut v: Vec<(u32, usize)> = longest.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// The logit penalty DRY gives a token that would extend a repeat of `len` tokens.
+    pub fn dry_penalty(&self, len: usize) -> f32 {
+        self.dry_multiplier * self.dry_base.powi(len.saturating_sub(self.dry_allowed_len) as i32)
+    }
+
+    fn apply_dry(&self, l: &mut [f32], h: &[u32]) {
+        for (id, len) in self.dry_matches(h) {
+            if let Some(x) = l.get_mut(id as usize) {
+                *x -= self.dry_penalty(len);
+            }
+        }
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
@@ -176,6 +303,35 @@ mod tests {
     }
 
     #[test]
+    fn dry_penalizes_continuing_a_repeat_and_nothing_else() {
+        let mut s = Sampler::greedy();
+        s.dry_multiplier = 1.0;
+        s.dry_base = 2.0;
+        s.dry_allowed_len = 2;
+        let l = vec![0.0f32; 10];
+        // "1 2 3 4 | 1 2 3": continuing with 4 would repeat "1 2 3 4".
+        // Match length 3 → penalty 1 · 2^(3−2) = 2 on token 4 only.
+        let p = s.penalties(&l, &[1, 2, 3, 4, 9, 1, 2, 3]);
+        assert_eq!(p, vec![(4, -2.0)]);
+        // A 2-token match is allowed: 1 · 2^0 = 1 (allowed_len means "free below").
+        assert_eq!(s.penalties(&l, &[2, 3, 4, 9, 2, 3]), vec![(4, -1.0)]);
+        // A single repeated token is not a sequence: nothing.
+        assert!(s.penalties(&l, &[5, 6, 7, 5]).is_empty());
+        // A breaker inside the earlier occurrence cuts the match short.
+        s.dry_breakers = vec![2];
+        assert!(s.penalties(&l, &[1, 2, 3, 4, 9, 1, 2, 3]).is_empty());
+        s.dry_breakers.clear();
+        // A token looping on itself: "7 7 7 7" → 7 is penalized hard.
+        let p = s.penalties(&l, &[7, 7, 7, 7, 7, 7]);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].0 == 7 && p[0].1 <= -8.0, "{p:?}");
+        // The longer the loop, the stronger the push away from it.
+        let short = s.penalties(&l, &[1, 2, 3, 4, 9, 1, 2, 3])[0].1;
+        let long = s.penalties(&l, &[1, 2, 3, 4, 5, 6, 9, 1, 2, 3, 4, 5])[0].1;
+        assert!(long < short);
+    }
+
+    #[test]
     fn repetition_penalty_matches_hf_and_rejects_nonsense() {
         // Token 0 would win, but it was just seen; with penalty 2 its logit
         // halves (2.0 → 1.0) and token 1 (1.5) wins under greedy.
@@ -188,6 +344,11 @@ mod tests {
         // Out-of-window history doesn't count.
         s.repeat_window = 1;
         assert_eq!(s.sample_with_history(&l, &[0, 2]), 0);
+        // Exempt tokens keep their logit.
+        s.repeat_window = 64;
+        s.no_penalty = vec![0];
+        assert_eq!(s.sample_with_history(&l, &[0]), 0);
+        s.no_penalty.clear();
         // Invalid penalties and out-of-vocab ids don't panic or produce NaN.
         for p in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             s.repeat_penalty = p;
