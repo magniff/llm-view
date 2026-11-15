@@ -8,7 +8,7 @@ const S = {
   sel: 0,          // selected position
   layer: 0,
   head: 0,
-  tab: 'lens',
+  tab: 'next',
   mid: false,      // logit lens: include post-attention rows
   lensColor: 'answer',
   lensStride: 1,
@@ -94,17 +94,17 @@ async function cached(key, method, args) {
 function flash(msg) {
   const f = $('#flash');
   f.textContent = msg;
-  f.style.display = 'block';
+  f.classList.add('show');
   clearTimeout(flash.t);
-  flash.t = setTimeout(() => (f.style.display = 'none'), 5000);
+  flash.t = setTimeout(() => f.classList.remove('show'), 5000);
 }
 
 async function act(fn) {
   if (S.busy) return;
   S.busy = true;
-  document.body.classList.add('busy');
+  document.body.classList.add('busy', 'working');
   try { await fn(); } catch (e) { flash(e.message); console.error(e); }
-  finally { S.busy = false; document.body.classList.remove('busy'); }
+  finally { S.busy = false; document.body.classList.remove('busy', 'working'); }
 }
 
 const tip = $('#tip');
@@ -143,11 +143,42 @@ function legend(label, fn, lo, hi) {
   return el('div', { class: 'legend' }, label ? el('span', { text: label }) : null, el('span', { text: lo }), c, el('span', { text: hi }));
 }
 
+// Range inputs show their fill as a gradient up to the thumb (--fill), and a
+// knob's <output> shows the value, or a word like "off" at a neutral setting.
+function syncRange(r) {
+  const min = +r.min || 0, max = r.max === '' ? 100 : +r.max, v = +r.value;
+  r.style.setProperty('--fill', (100 * (v - min) / Math.max(1e-9, max - min)).toFixed(2) + '%');
+  const out = r.nextElementSibling;
+  if (out && out.tagName === 'OUTPUT') {
+    const d = out.dataset;
+    const dec = (r.step.split('.')[1] || '').length;
+    out.textContent = (v === 0 && d.zero) || (v === max && d.max) || (v === min && d.min) || v.toFixed(dec);
+    out.classList.toggle('neutral', out.textContent !== v.toFixed(dec));
+  }
+}
+document.addEventListener('input', (e) => { if (e.target.type === 'range') syncRange(e.target); });
+function setRange(sel, v) {
+  const r = $(sel);
+  r.value = v;
+  syncRange(r);
+}
+
+// A labelled slider with a value pill, as in the completion controls.
+function knob(id, label, min, max, step, value, title, words = {}) {
+  const out = el('output');
+  for (const [k, w] of Object.entries(words)) out.dataset[k] = w;
+  const r = el('input', { id, type: 'range', min, max, step, value });
+  const k = el('div', { class: 'knob', title }, el('span', { text: label }), r, out);
+  syncRange(r);
+  return k;
+}
+
 function slider(label, value, max, oninput) {
-  const out = el('b', { text: String(value) });
+  const out = el('b', { class: 'pill', text: String(value) });
   const r = el('input', { type: 'range', min: 0, max, value });
+  syncRange(r);
   r.addEventListener('input', () => { out.textContent = r.value; oninput(+r.value); });
-  return el('label', {}, label, r, out);
+  return el('label', { class: 'slider' }, label, r, out);
 }
 
 function hiDPI(canvas, w, h) {
@@ -191,9 +222,16 @@ function setState(st, selMode = 'keep') {
 
 function renderHeader() {
   const m = S.st.model;
-  $('#model-info').textContent =
-    `${m.name} · ${(m.params / 1e6).toFixed(1)}M params · ${m.n_layers} layers · d_model ${m.hidden} · ` +
-    `${m.n_heads} query heads share ${m.n_kv_heads} KV heads × ${m.head_dim} dims · MLP ${m.intermediate} · vocab ${m.vocab}`;
+  if (!$('#model-info').childElementCount) {
+    const chip = (b, t, title) => el('span', { class: 'chip', title }, el('b', { text: b }), t);
+    $('#model-info').replaceChildren(
+      chip(`${(m.params / 1e6).toFixed(0)}M`, 'params', m.name),
+      chip(String(m.n_layers), 'layers'),
+      chip(String(m.hidden), 'd_model', 'width of the residual stream'),
+      chip(`${m.n_heads}/${m.n_kv_heads}`, 'heads', `${m.n_heads} query heads share ${m.n_kv_heads} KV heads (grouped-query attention), ${m.head_dim} dims each`),
+      chip(String(m.intermediate), 'MLP', 'hidden size of each SwiGLU MLP'),
+      chip(`${(m.vocab / 1000).toFixed(0)}k`, 'vocab', `${m.vocab} tokens`));
+  }
 }
 
 // Optional per-token weights drawn behind the token strip (attention overlay).
@@ -207,11 +245,17 @@ function renderTokens() {
   const box = $('#tokens');
   const w = tokenOverlay();
   const max = w ? Math.max(...w) : 1;
+  // Tokens that weren't in the strip last time pop in, one after another.
+  const ids = S.st.tokens.map((t) => t.id), prev = S.shownIds || [];
+  let same = 0;
+  while (same < ids.length && same < prev.length && ids[same] === prev[same]) same++;
+  S.shownIds = ids;
   box.replaceChildren(...S.st.tokens.map((t, i) => {
     const c = el('span', {
-      class: 'tok' + (t.gen ? ' gen' : '') + (t.special ? ' special' : '') + (i === S.sel ? ' sel' : ''),
+      class: 'tok' + (t.gen ? ' gen' : '') + (t.special ? ' special' : '') + (i === S.sel ? ' sel' : '') + (i >= same ? ' pop' : ''),
       text: vis(t.text),
     });
+    if (i >= same) c.style.animationDelay = Math.min(i - same, 40) * 18 + 'ms';
     if (w && i < w.length) c.style.setProperty('--w', (w[i] / max) ** 0.6);
     c.onclick = () => { S.sel = i; renderTokens(); renderTab(); };
     c.ondblclick = () => act(async () => setState(await call('rewind', { len: i + 1 }), 'last'));
@@ -236,28 +280,72 @@ function renderStatus() {
       `${(op.ms / Math.max(op.n, 1)).toFixed(0)} ms/token · ${op.stop}`;
   else if (op.kind === 'rewind')
     s = `rewound: cache truncated to ${op.pos0} positions, then position ${op.pos0} re-fed to get its logits · ${op.ms.toFixed(0)} ms`;
-  $('#status').replaceChildren(
-    el('span', { text: s }),
-    el('span', { class: 'cachebar', title: 'KV cache fill' }, el('i', { style: `width:${(100 * c.len) / c.max_seq}%` })),
-    el('span', { text: `KV cache ${c.len}/${c.max_seq} positions · ${fmtBytes(c.bytes)}` }));
+  const st = $('#status');
+  if (!st.childElementCount) {
+    st.append(el('span', { class: 'op' }), el('span', { class: 'cache' },
+      el('span', { class: 'cachebar', title: 'KV cache fill' }, el('i')), el('span', { class: 'cachetext' })));
+  }
+  st.querySelector('.op').replaceChildren(el('span', { class: 'opkind ' + op.kind, text: op.kind }), s.replace(/^\w+: /, ''));
+  st.querySelector('.cachebar i').style.width = `${(100 * c.len) / c.max_seq}%`;
+  st.querySelector('.cachetext').textContent = `KV cache ${c.len}/${c.max_seq} · ${fmtBytes(c.bytes)}`;
 }
 
 // ------------------------------------------------------------------ tabs
 
 const TABS = [
+  ['next', 'Next token', viewNext],
   ['lens', 'Logit lens', viewLens],
   ['attn', 'Attention', viewAttn],
-  ['resid', 'Residual stream', viewResid],
   ['kv', 'KV cache', viewKV],
-  ['mlp', 'MLP neurons', viewMLP],
-  ['next', 'Next token', viewNext],
-  ['tok', 'Tokenizer', viewTok],
+  ['resid', 'Residual stream', viewResid],
 ];
 
+const TAB_ICONS = {
+  lens: 'M2 3h12M2 6.5h12M2 10h12M2 13.5h7',
+  attn: 'M3 13 8 3l5 10M5 9h6',
+  resid: 'M2 12c2-6 4-6 6-3s4 3 6-4',
+  kv: 'M3 3h10v4H3zM3 9h10v4H3z',
+  next: 'M3 13V9M6.5 13V5M10 13V7M13.5 13V3',
+};
+
+// The tab bar is built once and only toggled afterwards, so the underline
+// (.ink) can slide from the old tab to the new one.
 function renderTabs() {
-  $('#tabs').replaceChildren(...TABS.map(([id, name]) =>
-    el('button', { class: S.tab === id ? 'active' : '', text: name, onclick: () => { S.tab = id; history.replaceState(null, '', '#' + id); renderTabs(); renderTokens(); renderTab(); } })));
+  const bar = $('#tabs');
+  if (!bar.childElementCount) {
+    bar.append(...TABS.map(([id, name]) => el('button', {
+      'data-tab': id,
+      onclick: () => {
+        if (S.tab === id) return;
+        S.tab = id; S.enter = true;
+        history.replaceState(null, '', '#' + id);
+        renderTabs(); renderTokens(); renderTab();
+      },
+    }, svgIcon(TAB_ICONS[id]), name)), el('span', { class: 'ink' }));
+  }
+  bar.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.tab === S.tab));
+  moveInk(bar);
 }
+
+function svgIcon(d) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', d);
+  svg.append(path);
+  return svg;
+}
+
+// Slide a container's .ink under its active button.
+function moveInk(bar) {
+  const ink = bar.querySelector('.ink'), b = bar.querySelector('button.active');
+  if (!ink || !b || !b.offsetWidth) return;
+  ink.style.width = b.offsetWidth + 'px';
+  ink.style.transform = `translateX(${b.offsetLeft}px)`;
+}
+addEventListener('resize', () => document.querySelectorAll('#tabs, #modes').forEach(moveInk));
 
 async function renderTab() {
   const gen = ++S.renderGen;
@@ -274,6 +362,15 @@ async function renderTab() {
     clearTimeout(slow);
     if (gen !== S.renderGen) return; // a newer render started meanwhile
     panel.replaceChildren(...[].concat(nodes).flat(Infinity).filter((c) => c != null && c !== false));
+    if (S.enter) {
+      // Fresh tab: fade its sections up and grow its bars, once.
+      S.enter = false;
+      panel.classList.remove('enter');
+      void panel.offsetWidth;
+      panel.classList.add('enter');
+      clearTimeout(S.enterT);
+      S.enterT = setTimeout(() => panel.classList.remove('enter'), 900);
+    }
     if (S.tab === 'attn') renderTokens(); // overlay depends on fetched data
   } catch (e) {
     clearTimeout(slow);
@@ -765,53 +862,6 @@ async function viewKV() {
   ];
 }
 
-// ---------------------------------------------------------------- MLP
-
-async function viewMLP() {
-  const m = S.st.model, toks = S.st.tokens, p = S.sel;
-  const M = await cached(`mlp${S.layer}:${p}`, 'mlp', { layer: S.layer, pos: p });
-  const h = M.hidden;
-  const amax = Math.max(...h.map(Math.abs), 1e-6);
-  const order = h.map((v, i) => [i, v]).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
-  const small = h.filter((v) => Math.abs(v) < 0.05 * amax).length;
-
-  const W = 1000, H = 160;
-  const cv = el('canvas');
-  const g = hiDPI(cv, W, H);
-  const bw = W / h.length;
-  g.fillStyle = '#2a303b'; g.fillRect(0, H / 2, W, 1);
-  h.forEach((v, i) => {
-    g.fillStyle = v >= 0 ? '#f0a050' : '#5fb3f0';
-    const len = (Math.abs(v) / amax) * (H / 2 - 4);
-    g.fillRect(i * bw, v >= 0 ? H / 2 - len : H / 2, Math.max(1, bw), len);
-  });
-  cv.onmousemove = (e) => {
-    const i = Math.floor((e.clientX - cv.getBoundingClientRect().left) / bw);
-    if (i < 0 || i >= h.length) return hideTip();
-    showTip(e, el('b', { text: `neuron ${i}` }), el('div', { text: `silu(gate)·up = ${h[i].toFixed(3)}` }));
-  };
-  cv.onmouseleave = hideTip;
-
-  return [
-    explain('The MLP is where most parameters live (', (3 * m.hidden * m.intermediate / 1e6).toFixed(2), 'M per layer of ', String((S.st.model.params / m.n_layers / 1e6).toFixed(1)), 'M). ',
-      'SwiGLU: two projections up to ', String(m.intermediate), ' "neurons", one passed through SiLU as a ', B('gate'), ', multiplied together, and projected back down. ',
-      'Each neuron is a feature detector: it fires when the input matches a pattern, and its down-projection column says what to add to the stream. ',
-      'Notice how few neurons carry most of the signal: activations are sparse-ish and heavy-tailed.'),
-    el('div', { class: 'controls' },
-      slider('layer', S.layer, m.n_layers - 1, (v) => { S.layer = v; renderTab(); }),
-      el('span', { class: 'dim', text: `position ${p} ${JSON.stringify(toks[p].text)} (click a token to change)` })),
-    el('div', { class: 'kpi' },
-      el('div', {}, el('b', { text: amax.toFixed(2) }), 'max |activation|'),
-      el('div', {}, el('b', { text: ((100 * small) / h.length).toFixed(1) + '%' }), 'of neurons under 5% of max'),
-      el('div', {}, el('b', { text: String(order.findIndex((_, k) => order.slice(0, k + 1).reduce((s, [, v]) => s + v * v, 0) >= 0.5 * h.reduce((s, v) => s + v * v, 0)) + 1) }), 'neurons hold half the energy')),
-    el('h3', { text: `all ${h.length} hidden activations, layer ${S.layer}` }),
-    el('div', { class: 'scroll' }, cv),
-    el('h3', { text: 'strongest neurons' }),
-    el('div', { class: 'bars' }, order.slice(0, 15).map(([i, v]) => [
-      el('span', { text: `#${i}` }), el('div', { class: 'bar' + (v < 0 ? '' : ' alt'), style: `width:${(Math.abs(v) / amax) * 400}px` }), el('span', { text: v.toFixed(3) })])),
-  ];
-}
-
 // ---------------------------------------------------------------- next token
 
 function samplingDist(top, lse) {
@@ -868,36 +918,6 @@ async function viewNext() {
   ];
 }
 
-// ---------------------------------------------------------------- tokenizer
-
-async function viewTok() {
-  const text = $('#prompt').value;
-  const T = await call('tokenize', { text });
-  const bytes = new TextEncoder().encode(text).length;
-  const words = T.words.map((w) => {
-    const steps = w.steps;
-    const shown = steps.length > 7 ? [...steps.slice(0, 3), null, ...steps.slice(-3)] : steps;
-    return el('div', { class: 'wordbox' },
-      el('div', { class: 'dim mono', text: JSON.stringify(w.word) }),
-      shown.map((s, si) => s === null
-        ? el('div', { class: 'dim', text: `… ${steps.length - 6} more merges …` })
-        : el('div', { class: 'chips' }, s.map(([id, t]) => el('span', {
-          class: 'chip' + (si > 0 && s.length < (shown[si - 1] || s).length && !(shown[si - 1] || []).some((x) => x[0] === id) ? ' new' : ''),
-          title: `id ${id}`, text: vis(t),
-        })))));
-  });
-  return [
-    explain('Byte-level BPE. The text is first split into "pre-tokens" (words with their leading space, single digits, punctuation runs, whitespace). ',
-      'Each starts as raw UTF-8 bytes, then the tokenizer repeatedly merges the adjacent pair that was learned ', B('earliest'), ' in training, until no learned pair is left. ',
-      'Each box below shows one pre-token being merged, top to bottom (orange = the newly merged token). Special tokens like <|im_start|> skip all this. This view tokenizes the prompt box above.'),
-    el('div', { class: 'kpi' },
-      el('div', {}, el('b', { text: String(bytes) }), 'UTF-8 bytes'),
-      el('div', {}, el('b', { text: String(T.ids.length) }), 'tokens'),
-      el('div', {}, el('b', { text: (bytes / Math.max(1, T.ids.length)).toFixed(2) }), 'bytes per token')),
-    el('div', {}, words),
-  ];
-}
-
 // ------------------------------------------------------------------ loading screen
 
 function showLoading(on, error) {
@@ -928,6 +948,10 @@ function setMode(mode) {
   $('#complete-view').hidden = mode !== 'complete';
   $('#chat-view').hidden = mode !== 'chat';
   document.querySelectorAll('#modes button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+  moveInk($('#modes'));
+  const view = $(mode === 'chat' ? '#chat-view' : '#complete-view');
+  view.classList.remove('appear'); void view.offsetWidth; view.classList.add('appear');
+  if (mode === 'complete') moveInk($('#tabs')); // it had no size while hidden
   history.replaceState(null, '', '#' + (mode === 'chat' ? 'chat' : S.tab));
   hideTip();
   if (mode === 'chat') {
@@ -1003,7 +1027,9 @@ function finishBubble(bubble) {
 function addBubble(role, text) {
   const body = el('div', { class: 'body' }, text || '');
   const meta = el('div', { class: 'meta dim' });
-  const node = el('div', { class: 'msg ' + role }, body, meta);
+  const node = role === 'assistant'
+    ? el('div', { class: 'msg assistant' }, el('div', { class: 'avatar', 'aria-hidden': 'true' }), el('div', { class: 'bubble' }, el('div', { class: 'dots', 'aria-hidden': 'true' }, el('i'), el('i'), el('i')), body, meta))
+    : el('div', { class: 'msg ' + role }, el('div', { class: 'bubble' }, body, meta));
   $('#messages').append(node);
   $('#messages').scrollTop = $('#messages').scrollHeight;
   return { node, body, meta, decoder: new TextDecoder() };
@@ -1026,9 +1052,12 @@ let chatLog = []; // [{role, text} | {role:'assistant', tokens, stop}] for re-re
 function renderChatBubbles() {
   $('#messages').replaceChildren();
   if (!chatLog.length) {
-    $('#messages').append(el('div', { class: 'empty dim' },
-      el('p', { text: 'Say something to SmolLM2-135M-Instruct.' }),
-      el('p', { text: 'It is a tiny model (135M parameters): fluent and quick, but often wrong. Hover any word of its replies to see what else it considered.' })));
+    const ideas = ['What is the capital of France?', 'Write a haiku about the sea.', 'Explain photosynthesis to a child.', 'Tell me a two-sentence story about a robot.'];
+    $('#messages').append(el('div', { class: 'empty' },
+      el('div', { class: 'empty-orb', 'aria-hidden': 'true' }),
+      el('h2', { text: 'Chat with SmolLM2-135M-Instruct' }),
+      el('p', { class: 'dim', text: 'A tiny model (135M parameters) running in this tab: fluent and quick, but often wrong. Hover any word of a reply to see what else it considered.' }),
+      el('div', { class: 'ideas' }, ideas.map((t) => el('button', { class: 'idea', text: t, onclick: () => { $('#chat-input').value = t; sendChat(); } })))));
     return;
   }
   for (const m of chatLog) {
@@ -1062,9 +1091,9 @@ function renderChatSide() {
 async function refreshChat() {
   C.st = await call('chat_state');
   const s = C.st.sampler;
-  $('#c-temp').value = +s.temperature.toFixed(3);
-  $('#c-topp').value = +s.top_p.toFixed(3);
-  $('#c-rep').value = +s.repeat_penalty.toFixed(2);
+  setRange('#c-temp', s.temperature);
+  setRange('#c-topp', s.top_p);
+  setRange('#c-rep', s.repeat_penalty);
   if (!$('#c-system').value) $('#c-system').value = C.st.system;
   renderChatSide();
   // Bubbles are built incrementally while chatting; only the raw view is redrawn from state.
@@ -1073,6 +1102,7 @@ async function refreshChat() {
 
 function setChatBusy(on) {
   C.busy = on;
+  document.body.classList.toggle('working', on);
   $('#send').hidden = on;
   $('#stop').hidden = !on;
 }
@@ -1090,7 +1120,7 @@ async function sendChat() {
   addBubble('user', text);
   const msg = { role: 'assistant', tokens: [], stop: '' };
   const bubble = addBubble('assistant');
-  bubble.node.classList.add('streaming');
+  bubble.node.classList.add('streaming', 'waiting');
   try {
     C.st = await call('chat_send', { text });
     chatLog.push(msg);
@@ -1099,6 +1129,7 @@ async function sendChat() {
       if (C.stopRequested) { await call('chat_stop'); msg.stop = 'stopped'; break; }
       const r = await call('chat_step', { n: 2, ...chatSamp() });
       msg.tokens.push(...r.tokens);
+      if (r.tokens.length) bubble.node.classList.remove('waiting');
       appendTokens(bubble, r.tokens);
       C.st.context = r.context;
       C.st.last_turn = r.last_turn;
@@ -1110,7 +1141,7 @@ async function sendChat() {
     flash(e.message);
   } finally {
     finishBubble(bubble);
-    bubble.node.classList.remove('streaming');
+    bubble.node.classList.remove('streaming', 'waiting');
     bubble.meta.textContent = msg.stop;
     setChatBusy(false);
     try { C.st = await call('chat_state'); renderChatSide(); } catch {}
@@ -1144,7 +1175,6 @@ async function inspectChat() {
 }
 
 function setupChat() {
-  const num = (id, value, step, title) => el('input', { id, type: 'number', step, min: 0, value, title });
   const raw = el('input', { type: 'checkbox', id: 'c-raw' });
   raw.onchange = () => { C.raw = raw.checked; if (C.raw) refreshChat(); else renderMessages(); };
   const tint = el('input', { type: 'checkbox' });
@@ -1167,10 +1197,10 @@ function setupChat() {
     el('label', { class: 'block' }, raw, 'show the raw token stream'),
     el('button', { class: 'wide', text: 'Inspect this conversation →', title: 'open the transcript in completion mode with every view', onclick: () => inspectChat() }),
     el('h3', { text: 'sampling' }),
-    el('div', { class: 'row tight' },
-      el('label', {}, 'temp', num('c-temp', 0.2, 0.1)),
-      el('label', {}, 'top-p', num('c-topp', 0.9, 0.05)),
-      el('label', {}, 'repeat', num('c-rep', 1.1, 0.05))),
+    el('div', { class: 'knobs stack' },
+      knob('c-temp', 'temperature', 0, 2, 0.05, 0.2, 'Divide the logits by this before softmax. 0 = always the top token', { zero: 'greedy' }),
+      knob('c-topp', 'top-p', 0, 1, 0.01, 0.9, 'Keep the smallest set of tokens whose probabilities add up to p', { max: 'off' }),
+      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1.1, 'Push down tokens used in the last 64 positions', { min: 'off' })),
     el('h3', { text: 'system prompt' }),
     el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false' }),
     el('button', { class: 'wide', text: 'New chat', title: 'clear the conversation (applies the system prompt)', onclick: () => newChat() }));
@@ -1219,7 +1249,7 @@ document.addEventListener('keydown', (e) => {
     $('#chat-input').disabled = false;
     const st = await call('state');
     const s = st.sampler;
-    $('#temp').value = +s.temperature.toFixed(3); $('#topp').value = +s.top_p.toFixed(3); $('#topk').value = s.top_k; $('#rep').value = +s.repeat_penalty.toFixed(2);
+    setRange('#temp', s.temperature); setRange('#topp', s.top_p); setRange('#topk', s.top_k); setRange('#rep', s.repeat_penalty);
     $('#prompt').value = st.tokens.map((t) => t.text).join('');
     setState(st, 'last');
     if (MODE === 'chat') await refreshChat();

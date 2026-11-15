@@ -62,9 +62,14 @@ async function openCache() {
   try { return await caches.open(CACHE); } catch { return null; } // unavailable outside secure contexts
 }
 
-async function fetchBytes(url, label, sha, useCache) {
-  const cache = useCache ? await openCache() : null;
-  let resp = cache ? await cache.match(url) : null;
+// Every file is kept in the browser's Cache API, whichever source it came from,
+// so a reload reads it from disk instead of the network. A file with a pinned
+// checksum is cached under that checksum: the same weights from localhost or
+// from Hugging Face are one entry, and they're re-verified on every load.
+async function fetchBytes(url, label, sha) {
+  const cache = await openCache();
+  const key = sha ? new URL(`/__weights/${sha}`, self.location.href).href : url;
+  let resp = cache ? await cache.match(key) : null;
   const cached = !!resp;
   if (!resp) {
     resp = await fetch(url);
@@ -97,7 +102,7 @@ async function fetchBytes(url, label, sha, useCache) {
       progress({ stage: 'verifying checksum', got: 0, total: 0 });
       const h = await sha256hex(buf);
       if (h !== sha) {
-        if (cache) await cache.delete(url);
+        if (cache) await cache.delete(key);
         throw new Error(`${label}: checksum mismatch (got ${h.slice(0, 12)}…, want ${sha.slice(0, 12)}…). The download was corrupted; reload to retry.`);
       }
     } else {
@@ -105,7 +110,7 @@ async function fetchBytes(url, label, sha, useCache) {
     }
   }
   if (!cached && cache) {
-    try { await cache.put(url, new Response(buf, { headers: { 'content-length': String(got) } })); } catch (e) { console.warn('could not cache', url, e); }
+    try { await cache.put(key, new Response(buf, { headers: { 'content-length': String(got) } })); } catch (e) { console.warn('could not cache', url, e); }
   }
   return buf;
 }
@@ -116,7 +121,6 @@ async function load(name, source) {
   const m = MODELS[name];
   if (!m) throw new Error(`unknown model ${name}; choose one of ${Object.keys(MODELS).join(', ')}`);
   // 'local': the dev server (`cargo run -p viz`) serves the repo's models/ folder.
-  // Fast, and no point caching it a second time in the browser.
   const local = source === 'local';
   const base = local ? `/models/${name}/` : `https://huggingface.co/${m.repo}/resolve/main/`;
   const from = local ? ' (localhost)' : '';
@@ -132,9 +136,9 @@ async function load(name, source) {
   ex = instance.exports;
   ex.install_panic_hook();
 
-  const cfg = dec.decode(await fetchBytes(base + 'config.json', 'config' + from, null, !local));
-  const tok = dec.decode(await fetchBytes(base + 'tokenizer.json', 'tokenizer' + from, null, !local));
-  let w = await fetchBytes(base + 'model.safetensors', 'weights' + from, m.sha256, !local);
+  const cfg = dec.decode(await fetchBytes(base + 'config.json', 'config' + from, null));
+  const tok = dec.decode(await fetchBytes(base + 'tokenizer.json', 'tokenizer' + from, null));
+  let w = await fetchBytes(base + 'model.safetensors', 'weights' + from, m.sha256);
 
   // safetensors: [u64 header length][JSON header][raw tensor bytes]
   const n = Number(new DataView(w.buffer, w.byteOffset, 8).getBigUint64(0, true));
