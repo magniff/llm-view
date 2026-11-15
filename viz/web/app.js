@@ -49,7 +49,7 @@ const fmtBytes = (b) => (b >= 1e6 ? (b / 1e6).toFixed(2) + ' MB' : (b / 1e3).toF
 
 const PARAMS = new URLSearchParams(location.search);
 const NATIVE = PARAMS.has('native');
-const MODEL = PARAMS.get('model') || 'smollm2-135m-instruct';
+const MODEL = 'smollm2-135m-instruct';
 // Where the weights come from: the local dev server when the page itself is on
 // localhost (no 269 MB downloads while developing), Hugging Face otherwise.
 const IS_LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
@@ -161,12 +161,19 @@ function hiDPI(canvas, w, h) {
 
 // ------------------------------------------------------------------ state
 
+// A numeric input, clamped to [lo, hi]; empty or garbage falls back to `def`.
+// (Not `+v || def`: that turns a deliberate 0, e.g. top-p 0 = greedy, into def.)
+function numIn(sel, def, lo = -Infinity, hi = Infinity) {
+  const v = parseFloat($(sel).value);
+  return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+}
+
 function samp() {
   return {
-    temperature: +$('#temp').value || 0,
-    top_p: +$('#topp').value || 1,
-    top_k: Math.max(0, +$('#topk').value | 0),
-    repeat_penalty: +$('#rep').value || 1,
+    temperature: numIn('#temp', 0, 0),
+    top_p: numIn('#topp', 1, 0, 1),
+    top_k: Math.floor(numIn('#topk', 0, 0, 1e6)),
+    repeat_penalty: numIn('#rep', 1, 0.01, 100),
   };
 }
 
@@ -865,7 +872,7 @@ async function viewNext() {
 
 async function viewTok() {
   const text = $('#prompt').value;
-  const T = await call('tokenize', { text, chat: $('#chat').checked });
+  const T = await call('tokenize', { text });
   const bytes = new TextEncoder().encode(text).length;
   const words = T.words.map((w) => {
     const steps = w.steps;
@@ -911,27 +918,281 @@ function showProgress(p) {
     : p.total ? `${p.got} / ${p.total}` : '';
 }
 
-function setupModelPicker() {
-  const sel = $('#model');
-  if (NATIVE) { sel.style.display = 'none'; return; }
-  sel.value = MODEL;
-  sel.onchange = () => {
-    const q = new URLSearchParams(location.search);
-    q.set('model', sel.value);
-    location.search = q.toString();
+// ------------------------------------------------------------------ modes
+
+let MODE = 'complete';
+let READY = false; // the engine is loaded
+
+function setMode(mode) {
+  MODE = mode;
+  $('#complete-view').hidden = mode !== 'complete';
+  $('#chat-view').hidden = mode !== 'chat';
+  document.querySelectorAll('#modes button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+  history.replaceState(null, '', '#' + (mode === 'chat' ? 'chat' : S.tab));
+  hideTip();
+  if (mode === 'chat') {
+    if (READY && !C.st) refreshChat();
+    $('#chat-input').focus();
+  } else if (S.st) {
+    renderTokens();
+    renderTab();
+  }
+}
+
+// ------------------------------------------------------------------ chat mode
+//
+// A normal chat app on top of the same engine, with a lighter look inside:
+// each reply token is tinted by how unsure the model was (hover for the
+// alternatives), and the side panel shows what each turn cost.
+
+const C = {
+  st: null,          // chat_state from the engine
+  busy: false,
+  stopRequested: false,
+  raw: false,        // show the raw token stream instead of bubbles
+  tint: true,        // tint uncertain tokens
+};
+
+function chatSamp() {
+  return {
+    temperature: numIn('#c-temp', 0, 0),
+    top_p: numIn('#c-topp', 1, 0, 1),
+    repeat_penalty: numIn('#c-rep', 1, 0.01, 100),
   };
+}
+
+function tintOf(p) {
+  // Confident tokens stay plain; the less sure the model was, the stronger the tint.
+  const a = Math.max(0, Math.min(0.6, (1 - p) * 0.75));
+  return a < 0.04 ? '' : `rgba(127,163,207,${a.toFixed(2)})`;
+}
+
+function tokenTip(e, t) {
+  showTip(e,
+    el('b', { text: `chose ${JSON.stringify(t.text)} · ${pct(t.p)}` }),
+    el('div', { class: 'bars', style: 'margin:6px 0' }, t.alts.map(([text, p]) => [
+      el('span', { class: 'mono', style: text === t.text ? 'color:var(--accent)' : '', text: clip(vis(text), 16) }),
+      el('div', { class: 'bar', style: `width:${Math.max(1, p * 160)}px` }),
+      el('span', { text: pct(p) })])),
+    el('div', { class: 'dim', text: t.p < 0.5 ? 'the model was unsure here: other tokens were nearly as likely' : 'the model\'s top 5 candidates at this point' }));
+}
+
+// Append reply tokens to an assistant bubble. Bytes go through a streaming UTF-8
+// decoder, because one character (emoji, CJK) can be split over several tokens.
+function appendTokens(bubble, tokens) {
+  for (const t of tokens) {
+    const piece = bubble.decoder.decode(new Uint8Array(t.bytes), { stream: true });
+    const span = el('span', { class: 'ct', text: piece });
+    span.dataset.p = t.p;
+    if (C.tint) span.style.background = tintOf(t.p);
+    span.onmousemove = (e) => tokenTip(e, t);
+    span.onmouseleave = hideTip;
+    bubble.body.append(span);
+  }
+  const box = $('#messages');
+  box.scrollTop = box.scrollHeight;
+}
+
+// End of a reply: a character cut off mid-way (the reply stopped inside an
+// emoji, say) is still in the decoder. Flush it as U+FFFD rather than drop it.
+function finishBubble(bubble) {
+  const tail = bubble.decoder.decode();
+  if (tail) bubble.body.append(el('span', { class: 'ct', text: tail }));
+}
+
+function addBubble(role, text) {
+  const body = el('div', { class: 'body' }, text || '');
+  const meta = el('div', { class: 'meta dim' });
+  const node = el('div', { class: 'msg ' + role }, body, meta);
+  $('#messages').append(node);
+  $('#messages').scrollTop = $('#messages').scrollHeight;
+  return { node, body, meta, decoder: new TextDecoder() };
+}
+
+function renderChatRaw() {
+  const box = $('#messages');
+  const toks = C.st ? C.st.tokens : [];
+  box.replaceChildren(
+    el('p', { class: 'explain' }, 'This is exactly what the model sees: ', B(`${toks.length} tokens`),
+      '. Chat is still text completion. The conversation is written in the ChatML format the model was fine-tuned on, ',
+      'and the reply is the model completing it. Each ', el('span', { class: 'mono', style: 'color:var(--accent)', text: '<|im_start|>' }),
+      ' / ', el('span', { class: 'mono', style: 'color:var(--accent)', text: '<|im_end|>' }),
+      ' is a single special token. The model ends its turn by producing <|im_end|> itself.'),
+    el('div', { class: 'rawstream' }, toks.map((t) => el('span', { class: 'tok' + (t.special ? ' special' : ''), text: vis(t.text), title: `id ${t.id}` }))));
+}
+
+let chatLog = []; // [{role, text} | {role:'assistant', tokens, stop}] for re-rendering
+
+function renderChatBubbles() {
+  $('#messages').replaceChildren();
+  if (!chatLog.length) {
+    $('#messages').append(el('div', { class: 'empty dim' },
+      el('p', { text: 'Say something to SmolLM2-135M-Instruct.' }),
+      el('p', { text: 'It is a tiny model (135M parameters): fluent and quick, but often wrong. Hover any word of its replies to see what else it considered.' })));
+    return;
+  }
+  for (const m of chatLog) {
+    if (m.role === 'user') { addBubble('user', m.text); continue; }
+    const b = addBubble('assistant');
+    appendTokens(b, m.tokens);
+    finishBubble(b);
+    if (m.stop) b.meta.textContent = m.stop;
+  }
+}
+
+function renderMessages() {
+  C.raw ? renderChatRaw() : renderChatBubbles();
+}
+
+function renderChatSide() {
+  if (!C.st) return;
+  const c = C.st.context, t = C.st.last_turn;
+  $('#c-ctxbar').style.width = (100 * c.len / c.max_seq).toFixed(1) + '%';
+  $('#c-ctx').textContent = `${c.len} / ${c.max_seq} tokens · KV cache ${fmtBytes(c.bytes)}`;
+  const turn = $('#c-turn');
+  if (!t) { turn.replaceChildren(el('span', { class: 'dim', text: 'nothing yet' })); return; }
+  const rate = t.generated / Math.max(1e-6, t.decode_ms / 1000);
+  turn.replaceChildren(
+    el('div', {}, B(String(t.prefilled)), ' new tokens prefilled in one pass', el('span', { class: 'dim', text: ` (${t.prefill_ms.toFixed(0)} ms)` })),
+    el('div', {}, B(String(t.reused)), ' earlier tokens reused from the KV cache'),
+    el('div', {}, B(String(t.generated)), ' tokens generated', t.generated ? el('span', { class: 'dim', text: ` · ${rate.toFixed(0)} tok/s` }) : null),
+    t.stop ? el('div', { class: 'dim', text: t.stop }) : null);
+}
+
+async function refreshChat() {
+  C.st = await call('chat_state');
+  const s = C.st.sampler;
+  $('#c-temp').value = +s.temperature.toFixed(3);
+  $('#c-topp').value = +s.top_p.toFixed(3);
+  $('#c-rep').value = +s.repeat_penalty.toFixed(2);
+  if (!$('#c-system').value) $('#c-system').value = C.st.system;
+  renderChatSide();
+  // Bubbles are built incrementally while chatting; only the raw view is redrawn from state.
+  if (C.raw) renderChatRaw();
+}
+
+function setChatBusy(on) {
+  C.busy = on;
+  $('#send').hidden = on;
+  $('#stop').hidden = !on;
+}
+
+async function sendChat() {
+  const input = $('#chat-input');
+  const text = input.value.trim();
+  if (!text || C.busy || !READY) return;
+  input.value = '';
+  setChatBusy(true);
+  C.stopRequested = false;
+  if (C.raw) { C.raw = false; $('#c-raw').checked = false; renderMessages(); }
+  if (!chatLog.length) $('#messages').replaceChildren();
+  chatLog.push({ role: 'user', text });
+  addBubble('user', text);
+  const msg = { role: 'assistant', tokens: [], stop: '' };
+  const bubble = addBubble('assistant');
+  bubble.node.classList.add('streaming');
+  try {
+    C.st = await call('chat_send', { text });
+    chatLog.push(msg);
+    renderChatSide();
+    for (;;) {
+      if (C.stopRequested) { await call('chat_stop'); msg.stop = 'stopped'; break; }
+      const r = await call('chat_step', { n: 2, ...chatSamp() });
+      msg.tokens.push(...r.tokens);
+      appendTokens(bubble, r.tokens);
+      C.st.context = r.context;
+      C.st.last_turn = r.last_turn;
+      renderChatSide();
+      if (r.done) { msg.stop = r.stop || ''; break; }
+    }
+  } catch (e) {
+    msg.stop = 'error: ' + e.message;
+    flash(e.message);
+  } finally {
+    finishBubble(bubble);
+    bubble.node.classList.remove('streaming');
+    bubble.meta.textContent = msg.stop;
+    setChatBusy(false);
+    try { C.st = await call('chat_state'); renderChatSide(); } catch {}
+    input.focus();
+  }
+}
+
+async function newChat() {
+  if (C.busy) return;
+  C.st = await call('chat_reset', { system: $('#c-system').value });
+  chatLog = [];
+  renderChatSide();
+  renderMessages();
+  $('#chat-input').focus();
+}
+
+// Hand the conversation to completion mode for the full set of views, as the
+// exact token ids chat produced. The inspector keeps a full trace per position,
+// so it holds fewer positions than chat; a long conversation is cut to its tail.
+async function inspectChat() {
+  if (C.busy || !C.st || !C.st.tokens.length) return;
+  const limit = S.st.cache.max_seq - 8;
+  let toks = C.st.tokens;
+  if (toks.length > limit) {
+    toks = toks.slice(-limit);
+    flash(`The conversation is ${C.st.tokens.length} tokens; the inspector holds ${S.st.cache.max_seq} positions (it stores every activation at every position), so it shows the last ${limit}.`);
+  }
+  $('#prompt').value = toks.map((t) => t.text).join('');
+  setMode('complete');
+  await act(async () => setState(await call('run', { ids: toks.map((t) => t.id) }), 'last'));
+}
+
+function setupChat() {
+  const num = (id, value, step, title) => el('input', { id, type: 'number', step, min: 0, value, title });
+  const raw = el('input', { type: 'checkbox', id: 'c-raw' });
+  raw.onchange = () => { C.raw = raw.checked; if (C.raw) refreshChat(); else renderMessages(); };
+  const tint = el('input', { type: 'checkbox' });
+  tint.checked = true;
+  tint.onchange = () => {
+    C.tint = tint.checked;
+    document.querySelectorAll('.msg .ct').forEach((s) => (s.style.background = C.tint ? tintOf(+s.dataset.p) : ''));
+  };
+  $('#chat-side').append(
+    el('h3', { text: 'context window' }),
+    el('div', { class: 'ctxbar' }, el('i', { id: 'c-ctxbar' })),
+    el('div', { id: 'c-ctx', class: 'dim small' }),
+    el('h3', { text: 'last turn' }),
+    el('div', { id: 'c-turn', class: 'small turn' }),
+    el('p', { class: 'explain small' },
+      'Only the new tokens of each turn go through the model in one pass (', B('prefill'), '); everything before is already in the ',
+      B('KV cache'), '. The reply then comes one token at a time (', B('decode'), '), each step reading the whole cache.'),
+    el('h3', { text: 'view' }),
+    el('label', { class: 'block' }, tint, 'tint tokens the model was unsure about'),
+    el('label', { class: 'block' }, raw, 'show the raw token stream'),
+    el('button', { class: 'wide', text: 'Inspect this conversation →', title: 'open the transcript in completion mode with every view', onclick: () => inspectChat() }),
+    el('h3', { text: 'sampling' }),
+    el('div', { class: 'row tight' },
+      el('label', {}, 'temp', num('c-temp', 0.2, 0.1)),
+      el('label', {}, 'top-p', num('c-topp', 0.9, 0.05)),
+      el('label', {}, 'repeat', num('c-rep', 1.1, 0.05))),
+    el('h3', { text: 'system prompt' }),
+    el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false' }),
+    el('button', { class: 'wide', text: 'New chat', title: 'clear the conversation (applies the system prompt)', onclick: () => newChat() }));
+
+  $('#composer').onsubmit = (e) => { e.preventDefault(); sendChat(); };
+  $('#chat-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
+  });
+  $('#stop').onclick = () => (C.stopRequested = true);
+  document.querySelectorAll('#modes button').forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
+  renderMessages();
 }
 
 // ------------------------------------------------------------------ wiring
 
-$('#run').onclick = () => act(async () => setState(await call('run', { text: $('#prompt').value, chat: $('#chat').checked }), 'last'));
+$('#run').onclick = () => act(async () => setState(await call('run', { text: $('#prompt').value }), 'last'));
 $('#step').onclick = () => act(async () => setState(await call('step', { n: 1, ...samp() }), 'last'));
 $('#gen').onclick = () => act(async () => setState(await call('step', { n: 16, ...samp() }), 'last'));
 $('#prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('#run').click(); } });
 for (const id of ['#temp', '#topp', '#topk', '#rep']) $(id).addEventListener('input', () => { if (S.tab === 'next') renderTab(); });
-$('#chat').addEventListener('change', () => { if (S.tab === 'tok') renderTab(); });
 document.addEventListener('keydown', (e) => {
-  if (!S.st || e.target.matches('textarea, input')) return;
+  if (MODE !== 'complete' || !S.st || e.target.matches('textarea, input')) return;
   if (e.key === 'ArrowLeft' && S.sel > 0) S.sel--;
   else if (e.key === 'ArrowRight' && S.sel < S.st.tokens.length - 1) S.sel++;
   else return;
@@ -944,19 +1205,24 @@ document.addEventListener('keydown', (e) => {
   const fromHash = location.hash.slice(1);
   if (TABS.some((t) => t[0] === fromHash)) S.tab = fromHash;
   renderTabs();
-  setupModelPicker();
+  setupChat();
+  setMode(fromHash === 'chat' ? 'chat' : 'complete');
   try {
+    $('#chat-input').disabled = true;
     if (!NATIVE) {
       showLoading(true);
       startWorker(showProgress);
       await call('__load', { model: MODEL, source: SOURCE });
       showLoading(false);
     }
+    READY = true;
+    $('#chat-input').disabled = false;
     const st = await call('state');
     const s = st.sampler;
     $('#temp').value = +s.temperature.toFixed(3); $('#topp').value = +s.top_p.toFixed(3); $('#topk').value = s.top_k; $('#rep').value = +s.repeat_penalty.toFixed(2);
     $('#prompt').value = st.tokens.map((t) => t.text).join('');
     setState(st, 'last');
+    if (MODE === 'chat') await refreshChat();
   } catch (e) {
     showLoading(true, e.message);
     flash(e.message);

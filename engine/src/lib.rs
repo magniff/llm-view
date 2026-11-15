@@ -31,6 +31,7 @@ pub mod session;
 pub mod tensor;
 pub mod tokenizer;
 pub mod trace;
+mod unicode_tables;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;

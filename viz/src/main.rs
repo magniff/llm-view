@@ -1,9 +1,11 @@
 //! Native server for the visualizer (for local development; the page can
 //! also run the engine entirely in the browser via WebAssembly; see `viz/web/`).
 //!
-//!   cargo run --release -p viz                 # http://127.0.0.1:7860/?native
-//!   cargo run --release -p viz -- --size 360m --base --port 8000
+//!   cargo run --release -p viz                 # http://127.0.0.1:7860/  (?native: use this server)
+//!   cargo run --release -p viz -- --port 8000
 //!   cargo run --release -p viz -- --static     # files only: no model loaded here
+//!
+//! The visualizer uses SmolLM2-135M-Instruct.
 //!
 //! It also serves the repo's `models/` folder at `/models/`, which the
 //! in-browser engine uses when the page is opened on localhost, so testing
@@ -41,18 +43,16 @@ async fn call(State(st): State<Shared>, Path(method): Path<String>, body: Option
 }
 
 fn main() -> engine::Result<()> {
-    let (mut size, mut base, mut port, mut stat) = ("135m".to_string(), false, 7860u16, false);
+    let (mut port, mut stat) = (7860u16, false);
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--size" => size = it.next().ok_or("--size needs a value")?,
-            "--base" => base = true,
             "--static" => stat = true,
             "--port" => port = it.next().ok_or("--port needs a value")?.parse()?,
-            _ => return Err(format!("unknown argument {a} (use --size 135m|360m, --base, --port N, --static)").into()),
+            _ => return Err(format!("unknown argument {a} (use --port N, --static)").into()),
         }
     }
-    let spec = download::spec(&size, !base).ok_or("unknown --size (use 135m or 360m)")?;
+    let spec = &download::SMOLLM2_135M_INSTRUCT;
     let models = concat!(env!("CARGO_MANIFEST_DIR"), "/../models");
     let dir = format!("{models}/{}", spec.dir);
     // The in-browser engine fetches from /models/ on localhost, so make sure it's there.
@@ -63,7 +63,7 @@ fn main() -> engine::Result<()> {
     if !stat {
         let model = Model::load(&dir)?;
         let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json"))?;
-        let session = Session::new(model, tok, spec.dir, 1024)?;
+        let session = Session::new(model, tok, spec.dir, 1024, 2048)?;
         app = app.route("/api/call/{method}", post(call).with_state(Arc::new(Mutex::new(session))));
     }
     let app = app.nest_service("/models", ServeDir::new(models)).fallback_service(ServeDir::new(web));

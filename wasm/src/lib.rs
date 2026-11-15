@@ -14,7 +14,7 @@
 //! - `init(config, tokenizer, header)`: parse the small files and the safetensors
 //!   header, and reply with the byte range of every tensor;
 //! - `put_tensor(name, bytes)` once per tensor: decode bf16 → f32 and keep it;
-//! - `finish(max_seq)`: assemble the model and start a [`Session`].
+//! - `finish(max_seq, chat_ctx)`: assemble the model and start a [`Session`].
 //!
 //! After that, `call(method, args)` is the whole API (see `engine::session`).
 
@@ -145,7 +145,7 @@ pub unsafe extern "C" fn put_tensor(name_ptr: *mut u8, name_len: usize, data_ptr
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn finish(max_seq: usize) -> u32 {
+pub extern "C" fn finish(max_seq: usize, chat_ctx: usize) -> u32 {
     reply(STATE.with(|s| {
         let st = std::mem::replace(&mut *s.borrow_mut(), State::Empty);
         let State::Loading { cfg, tok, mut tensors, name, .. } = st else {
@@ -153,7 +153,7 @@ pub extern "C" fn finish(max_seq: usize) -> u32 {
         };
         let model = Model::from_loader(cfg, |n| tensors.remove(n).ok_or_else(|| format!("missing tensor {n}").into()))
             .map_err(|e| e.to_string())?;
-        let session = Session::new(model, tok, &name, max_seq)?;
+        let session = Session::new(model, tok, &name, max_seq, chat_ctx)?;
         *s.borrow_mut() = State::Ready(Box::new(session));
         Ok(Value::Null)
     }))

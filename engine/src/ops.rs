@@ -115,28 +115,29 @@ mod wasm_simd {
         s
     }
 
-    /// Caller guarantees every `x[r].len() == w.len()`.
+    /// Caller guarantees every `x[r].len() == w.len()`. Bit-identical to [`dot`] per row.
     #[inline]
     pub unsafe fn dot4(w: &[f32], x: [&[f32]; 4]) -> [f32; 4] {
         let n = w.len();
         let pw = w.as_ptr();
         let px = x.map(|r| r.as_ptr());
-        let mut acc = [[f32x4_splat(0.0); 2]; 4];
+        let mut acc = [[f32x4_splat(0.0); 4]; 4];
         let mut i = 0;
-        while i + 8 <= n {
-            // SAFETY: i + 8 <= n for w and every x[r].
+        while i + 16 <= n {
+            // SAFETY: i + 16 <= n for w and every x[r].
             unsafe {
-                let w0 = load(pw.add(i));
-                let w1 = load(pw.add(i + 4));
+                let wv = [load(pw.add(i)), load(pw.add(i + 4)), load(pw.add(i + 8)), load(pw.add(i + 12))];
                 for r in 0..4 {
-                    acc[r][0] = f32x4_add(acc[r][0], f32x4_mul(load(px[r].add(i)), w0));
-                    acc[r][1] = f32x4_add(acc[r][1], f32x4_mul(load(px[r].add(i + 4)), w1));
+                    for k in 0..4 {
+                        acc[r][k] = f32x4_add(acc[r][k], f32x4_mul(load(px[r].add(i + 4 * k)), wv[k]));
+                    }
                 }
             }
-            i += 8;
+            i += 16;
         }
         std::array::from_fn(|r| {
-            let mut s = hsum(f32x4_add(acc[r][0], acc[r][1]));
+            let a = &acc[r];
+            let mut s = hsum(f32x4_add(f32x4_add(a[0], a[1]), f32x4_add(a[2], a[3])));
             for j in i..n {
                 s += x[r][j] * w[j];
             }
@@ -173,26 +174,31 @@ mod neon {
     }
 
     /// Caller guarantees every `x[r].len() == w.len()`.
+    ///
+    /// Per row, exactly the lane layout and reduction order of [`dot`], so
+    /// `dot4(w, x)[r] == dot(x[r], w)` bit for bit, and a token gets identical
+    /// logits whether it was part of a prefill or fed alone during decode.
     #[inline]
     pub unsafe fn dot4(w: &[f32], x: [&[f32]; 4]) -> [f32; 4] {
         let n = w.len();
         let pw = w.as_ptr();
         let px = x.map(|r| r.as_ptr());
         unsafe {
-            // 4 rows × 2 registers = 8 independent accumulators (32 lanes).
-            let mut acc = [[vdupq_n_f32(0.0); 2]; 4];
+            // 4 rows × 4 registers = 16 accumulators; plus 4 for w. NEON has 32.
+            let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
             let mut i = 0;
-            while i + 8 <= n {
-                let w0 = vld1q_f32(pw.add(i));
-                let w1 = vld1q_f32(pw.add(i + 4));
+            while i + 16 <= n {
+                let wv = [vld1q_f32(pw.add(i)), vld1q_f32(pw.add(i + 4)), vld1q_f32(pw.add(i + 8)), vld1q_f32(pw.add(i + 12))];
                 for r in 0..4 {
-                    acc[r][0] = vfmaq_f32(acc[r][0], vld1q_f32(px[r].add(i)), w0);
-                    acc[r][1] = vfmaq_f32(acc[r][1], vld1q_f32(px[r].add(i + 4)), w1);
+                    for k in 0..4 {
+                        acc[r][k] = vfmaq_f32(acc[r][k], vld1q_f32(px[r].add(i + 4 * k)), wv[k]);
+                    }
                 }
-                i += 8;
+                i += 16;
             }
             std::array::from_fn(|r| {
-                let mut s = vaddvq_f32(vaddq_f32(acc[r][0], acc[r][1]));
+                let a = &acc[r];
+                let mut s = vaddvq_f32(vaddq_f32(vaddq_f32(a[0], a[1]), vaddq_f32(a[2], a[3])));
                 for j in i..n {
                     s += x[r][j] * w[j];
                 }
@@ -347,5 +353,128 @@ pub fn rope(v: &mut [f32], pos: usize, inv_freq: &[f32]) {
         let (a, b) = (v[i], v[i + half]);
         v[i] = a * cos - b * sin;
         v[i + half] = b * cos + a * sin;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random values in [-1, 1).
+    fn rnd(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn dot_f64(a: &[f32], b: &[f32]) -> f64 {
+        a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum()
+    }
+
+    #[test]
+    fn dot_matches_f64_for_every_tail_length() {
+        // 0..70 covers empty input and every remainder modulo 4, 8 and 16.
+        for n in 0..70 {
+            let (a, b) = (rnd(n, 1), rnd(n, 2));
+            let got = dot(&a, &b) as f64;
+            let want = dot_f64(&a, &b);
+            assert!((got - want).abs() <= 1e-5 * (1.0 + want.abs()), "n={n}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn dot4_is_bit_identical_to_dot() {
+        for n in [0, 1, 7, 15, 16, 17, 33, 64, 576, 577] {
+            let w = rnd(n, 3);
+            let xs: Vec<Vec<f32>> = (0..4).map(|r| rnd(n, 10 + r)).collect();
+            let got = dot4(&w, [&xs[0], &xs[1], &xs[2], &xs[3]]);
+            for r in 0..4 {
+                assert_eq!(got[r].to_bits(), dot(&xs[r], &w).to_bits(), "n={n} row={r}");
+            }
+        }
+    }
+
+    /// Prefill (many rows, dot4 + threads) and decode (one row, dot) must give
+    /// bit-identical results for the same row, for any shape.
+    #[test]
+    fn linear_is_independent_of_batching_and_threads() {
+        for (t, d_in, d_out) in [(1, 5, 3), (3, 17, 9), (7, 64, 130), (9, 576, 1000), (5, 33, 3000)] {
+            let x = Tensor::new(vec![t, d_in], rnd(t * d_in, 5));
+            let w = Tensor::new(vec![d_out, d_in], rnd(d_out * d_in, 6));
+            let all = linear(&x, &w);
+            let serial = linear_serial(&x, &w);
+            assert_eq!(all, serial, "threaded vs serial, shape {t}x{d_in}x{d_out}");
+            for r in 0..t {
+                let one = linear(&Tensor::new(vec![1, d_in], x.row(r).to_vec()), &w);
+                assert_eq!(one.row(0), all.row(r), "row {r} alone vs in a batch, shape {t}x{d_in}x{d_out}");
+                for o in [0, d_out / 2, d_out - 1] {
+                    let want = dot_f64(x.row(r), w.row(o));
+                    assert!((all.row(r)[o] as f64 - want).abs() <= 1e-4 * (1.0 + want.abs()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rope_is_identity_at_zero_and_preserves_pair_norms() {
+        let inv = rope_inv_freq(64, 100_000.0);
+        let v = rnd(64, 7);
+        let mut z = v.clone();
+        rope(&mut z, 0, &inv);
+        assert_eq!(z, v);
+        for pos in [1, 17, 4095, 8191] {
+            let mut r = v.clone();
+            rope(&mut r, pos, &inv);
+            for i in 0..32 {
+                let before = v[i].hypot(v[i + 32]);
+                let after = r[i].hypot(r[i + 32]);
+                assert!((before - after).abs() < 1e-5, "pos {pos} pair {i}");
+            }
+        }
+    }
+
+    /// The point of RoPE: q·k depends only on the distance between positions.
+    #[test]
+    fn rope_scores_depend_only_on_relative_position() {
+        let inv = rope_inv_freq(64, 100_000.0);
+        let (q, k) = (rnd(64, 8), rnd(64, 9));
+        let score = |pq: usize, pk: usize| {
+            let (mut a, mut b) = (q.clone(), k.clone());
+            rope(&mut a, pq, &inv);
+            rope(&mut b, pk, &inv);
+            dot(&a, &b)
+        };
+        let base = score(10, 3);
+        for shift in [1, 100, 1000] {
+            assert!((score(10 + shift, 3 + shift) - base).abs() < 2e-3, "shift {shift}");
+        }
+    }
+
+    #[test]
+    fn softmax_is_stable_and_normalized() {
+        let mut v = vec![1000.0, 1001.0, 999.0, -1e30];
+        softmax(&mut v);
+        assert!(v.iter().all(|p| p.is_finite() && *p >= 0.0));
+        assert!((v.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(v[1] > v[0] && v[0] > v[2]);
+        let mut one = vec![-5.0];
+        softmax(&mut one);
+        assert_eq!(one, vec![1.0]);
+    }
+
+    #[test]
+    fn rmsnorm_gives_unit_rms() {
+        let x = Tensor::new(vec![2, 8], rnd(16, 11).iter().map(|v| v * 30.0).collect());
+        let y = rmsnorm(&x, &[1.0; 8], 1e-5);
+        for r in 0..2 {
+            let rms = (y.row(r).iter().map(|v| v * v).sum::<f32>() / 8.0).sqrt();
+            assert!((rms - 1.0).abs() < 1e-4);
+        }
     }
 }

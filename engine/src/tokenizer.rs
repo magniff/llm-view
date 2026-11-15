@@ -246,6 +246,28 @@ fn split_digits(s: &str) -> Vec<&str> {
     out
 }
 
+/// `\p{L}`: General_Category Letter. Not `char::is_alphabetic`, which is the
+/// wider Alphabetic property and also includes combining vowel signs such as
+/// Devanagari "ि" (Mc) or circled letters like "Ⓐ" (So). Using it would glue
+/// "हिन्दी" into one piece where HF splits it into six.
+pub fn is_letter(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic();
+    }
+    let c = c as u32;
+    crate::unicode_tables::LETTER
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
 /// The GPT-2 pre-tokenization regex, written out by hand:
 ///
 /// ```text
@@ -257,7 +279,7 @@ fn split_digits(s: &str) -> Vec<&str> {
 /// space* when a word follows, so that space can attach to the word
 /// ("a   b" → "a", "  ", " b").
 pub fn pretokenize(s: &str) -> Vec<&str> {
-    let is_l = |c: char| c.is_alphabetic();
+    let is_l = is_letter;
     let is_n = |c: char| c.is_numeric();
     let is_ws = |c: char| c.is_whitespace();
     let is_other = |c: char| !is_ws(c) && !is_l(c) && !is_n(c);
@@ -304,4 +326,32 @@ pub fn pretokenize(s: &str) -> Vec<&str> {
         i = end;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letters_are_general_category_l_not_alphabetic() {
+        // Lo, Lu, Ll, Lm are letters...
+        for c in ['a', 'Z', 'é', 'ह', 'न', '日', 'Ω', 'ʰ'] {
+            assert!(is_letter(c), "{c:?}");
+        }
+        // ...but vowel signs (Mc/Mn), the virama (Mn), circled letters (So),
+        // digits and punctuation are not, even though some are Alphabetic.
+        for c in ['ि', 'ा', '\u{94d}', 'Ⓐ', '\u{345}', '1', '٣', '\'', ' '] {
+            assert!(!is_letter(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn pretokenize_matches_hf_on_combining_marks() {
+        // From HF tokenizers' ByteLevel pre_tokenize_str (decoded back to text).
+        assert_eq!(pretokenize("हिन्दी"), ["ह", "ि", "न", "\u{94d}", "द", "ी"]);
+        assert_eq!(pretokenize("का's"), ["क", "ा'", "s"]);
+        assert_eq!(pretokenize("Ⓐ's"), ["Ⓐ'", "s"]);
+        assert_eq!(pretokenize("a   b"), ["a", "  ", " b"]);
+        assert_eq!(pretokenize("it's 12"), ["it", "'s", " 12"]);
+    }
 }

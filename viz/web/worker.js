@@ -9,12 +9,13 @@
 
 const MODELS = {
   'smollm2-135m-instruct': { repo: 'HuggingFaceTB/SmolLM2-135M-Instruct', sha256: '5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c' },
-  'smollm2-135m': { repo: 'HuggingFaceTB/SmolLM2-135M', sha256: '80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1' },
-  'smollm2-360m-instruct': { repo: 'HuggingFaceTB/SmolLM2-360M-Instruct', sha256: 'e6bffe7435d7ddc10fd3b9a9efd429dafbacb1cb17015fb5562664e7532bf86e' },
-  'smollm2-360m': { repo: 'HuggingFaceTB/SmolLM2-360M', sha256: '7aaff6661428bed033abba9522bec81938678642cca3181fe752b6ca9e1e540f' },
 };
 const CACHE = 'smollm2-files-v1';
-const MAX_SEQ = 512; // positions; the trace keeps ~0.3 MB per position in memory
+// Inspector positions. Its trace grows with N positions as ~0.33 MB·N (residual
+// snapshots + MLP activations) plus 540 B·N² (every head's attention row), so
+// about 170 + 140 MB at 512. Raise it with care: wasm32 tops out at 4 GB.
+const MAX_SEQ = 512;
+const CHAT_CTX = 2048; // chat positions; the KV cache needs 46 KB per position (135M)
 
 let ex = null; // wasm exports
 let crashed = '';
@@ -146,7 +147,7 @@ async function load(name, source) {
   }
   w = null; // let the 269 MB download be garbage-collected
   progress({ stage: 'warming up', got: 0, total: 0 });
-  invoke(() => ex.finish(MAX_SEQ));
+  invoke(() => ex.finish(MAX_SEQ, CHAT_CTX));
   return { name, max_seq: MAX_SEQ };
 }
 

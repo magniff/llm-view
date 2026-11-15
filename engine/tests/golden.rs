@@ -96,8 +96,8 @@ fn kv_cache_matches_full_recompute() {
     m.forward(&seq[..split], &mut cache, &mut NoHooks);
     for (i, &t) in seq.iter().enumerate().skip(split) {
         let step = m.forward(&[t], &mut cache, &mut NoHooks);
-        let e = rel_err(step.row(0), full.row(i));
-        assert!(e < 1e-4, "position {i}: cached logits differ, rel err {e:.2e}");
+        // Bit-identical: decode (one row, `dot`) and prefill (`dot4`) share a reduction order.
+        assert_eq!(step.row(0), full.row(i), "position {i}: cached decode differs from full prefill");
     }
     assert_eq!(cache.len, seq.len());
 }
@@ -172,4 +172,22 @@ fn conversation_transcript_is_chatml() {
         assert_eq!(tok.decode(&conv.tokens), expected);
         assert_eq!(conv.cache.len, conv.tokens.len());
     }
+}
+
+/// Prompts generate() can't run are a no-op, not a panic: nothing generated,
+/// cache untouched, `on_text` never called.
+#[test]
+fn generate_refuses_empty_and_oversized_prompts() {
+    use engine::generate::generate;
+    let m = model();
+    let tok = tokenizer();
+    let mut cache = m.new_cache(16);
+    let mut called = false;
+    let s = generate(m, &tok, &mut cache, &[], &mut Sampler::greedy(), 8, &[], &mut NoHooks, |_| called = true);
+    assert!(s.generated.is_empty() && cache.len == 0 && !called);
+    let s = generate(m, &tok, &mut cache, &[1; 17], &mut Sampler::greedy(), 8, &[], &mut NoHooks, |_| called = true);
+    assert!(s.generated.is_empty() && cache.len == 0 && !called);
+    // Exactly full: prefill fits, but there's no room to feed anything back.
+    let s = generate(m, &tok, &mut cache, &[1; 16], &mut Sampler::greedy(), 8, &[], &mut NoHooks, |_| {});
+    assert!(s.generated.is_empty() && cache.len == 16);
 }

@@ -50,7 +50,32 @@ TOKENIZER_CASES = [
     "<|im_start|>user\nhi<|im_end|>\n<|endoftext|>",
     "fractions ½ and arabic digits ٣٤",
     "",
+    # \p{L} is General_Category L, not Unicode Alphabetic: combining vowel
+    # signs and circled letters are "other", which changes the splits.
+    "का's",
+    "Ⓐ's",
+    "नमस्ते's अच्छा",
+    "xͅ's",
+    # Unicode whitespace: NBSP, ideographic space, line separator, NEL.
+    "a\u00a0b  \u3000\u3000c x\u2028y \u0085z",
 ]
+
+
+def unicode_sweep():
+    """Assigned code points across the whole range, each in a few contexts
+    (before a contraction, after a space, next to a digit and a letter), so
+    every character class boundary in the pre-tokenizer gets exercised."""
+    import unicodedata
+
+    cps = [
+        cp
+        for cp in range(0x80, 0x323B0, 41)
+        if unicodedata.category(chr(cp)) not in ("Cn", "Co", "Cs")
+    ]
+    out = []
+    for i in range(0, len(cps), 24):
+        out.append("".join(f"{chr(c)}'s {chr(c)}1a{chr(c)} " for c in cps[i : i + 24]))
+    return out
 
 
 def main():
@@ -64,7 +89,7 @@ def main():
     tok = Tokenizer.from_file(os.path.join(MODEL, "tokenizer.json"))
 
     # ---- tokenizer cases -------------------------------------------------
-    cases = [{"text": t, "ids": tok.encode(t).ids} for t in TOKENIZER_CASES]
+    cases = [{"text": t, "ids": tok.encode(t).ids} for t in TOKENIZER_CASES + unicode_sweep()]
     with open(os.path.join(OUT, "tokenizer_cases.json"), "w") as f:
         json.dump(cases, f, ensure_ascii=False, indent=1)
 

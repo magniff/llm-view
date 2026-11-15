@@ -174,6 +174,10 @@ fn main() -> engine::Result<()> {
         } else {
             conv.prompt_for(&tok, &msg)
         };
+        if prompt.is_empty() {
+            println!("{DIM}that text encodes to no tokens{RESET}");
+            continue;
+        }
         if prompt.len() + 1 >= conv.room_left() {
             println!("{DIM}context full — /reset to start over (or raise --ctx){RESET}");
             if !a.complete {

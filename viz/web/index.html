@@ -9,36 +9,51 @@
 <body>
 <header>
   <h1>Inside SmolLM2</h1>
+  <nav id="modes" aria-label="mode">
+    <button data-mode="complete" title="Raw text in, every internal view">Completion</button>
+    <button data-mode="chat" title="A chat app, with a lighter look inside">Chat</button>
+  </nav>
   <span id="model-info" class="dim"></span>
-  <select id="model" title="Model (runs in your browser; downloaded from Hugging Face once, then cached)">
-    <option value="smollm2-135m-instruct">SmolLM2-135M-Instruct · 269 MB</option>
-    <option value="smollm2-135m">SmolLM2-135M (base) · 269 MB</option>
-    <option value="smollm2-360m-instruct">SmolLM2-360M-Instruct · 724 MB</option>
-    <option value="smollm2-360m">SmolLM2-360M (base) · 724 MB</option>
-  </select>
 </header>
 
-<section id="controls">
-  <textarea id="prompt" rows="2" spellcheck="false" placeholder="Type a prompt… (Ctrl/⌘+Enter to run)"></textarea>
-  <div class="row">
-    <label title="Wrap the prompt in the ChatML template the instruct model was trained on"><input type="checkbox" id="chat"> chat template</label>
-    <button id="run" class="primary">Run prompt</button>
-    <span class="sep"></span>
-    <button id="step" title="Sample one token and feed it through the model (one decode step)">Step +1</button>
-    <button id="gen" title="16 decode steps">Generate +16</button>
-    <span class="sep"></span>
-    <label>temp <input id="temp" type="number" step="0.1" min="0" value="0.7"></label>
-    <label>top-p <input id="topp" type="number" step="0.05" min="0" max="1" value="0.9"></label>
-    <label>top-k <input id="topk" type="number" step="1" min="0" value="0"></label>
-    <label title="Logits of tokens seen in the last 64 positions are pushed down by this factor">repeat <input id="rep" type="number" step="0.05" min="1" value="1.1"></label>
+<div id="complete-view">
+  <section id="controls">
+    <textarea id="prompt" rows="2" spellcheck="false" placeholder="Type a prompt… (Ctrl/⌘+Enter to run)"></textarea>
+    <div class="row">
+      <button id="run" class="primary">Run prompt</button>
+      <span class="sep"></span>
+      <button id="step" title="Sample one token and feed it through the model (one decode step)">Step +1</button>
+      <button id="gen" title="16 decode steps">Generate +16</button>
+      <span class="sep"></span>
+      <label>temp <input id="temp" type="number" step="0.1" min="0" value="0.7"></label>
+      <label>top-p <input id="topp" type="number" step="0.05" min="0" max="1" value="0.9"></label>
+      <label>top-k <input id="topk" type="number" step="1" min="0" value="0"></label>
+      <label title="Logits of tokens seen in the last 64 positions are pushed down by this factor">repeat <input id="rep" type="number" step="0.05" min="1" value="1.1"></label>
+    </div>
+  </section>
+
+  <section id="tokens" aria-label="tokens"></section>
+  <div id="status"></div>
+
+  <nav id="tabs"></nav>
+  <main id="panel"></main>
+</div>
+
+<div id="chat-view" hidden>
+  <div class="chat-layout">
+    <section class="chat-main">
+      <div id="messages" aria-live="polite"></div>
+      <form id="composer">
+        <textarea id="chat-input" rows="2" placeholder="Message SmolLM2… (Enter to send, Shift+Enter for a new line)"></textarea>
+        <div class="composer-buttons">
+          <button id="send" class="primary" type="submit">Send</button>
+          <button id="stop" type="button" hidden>Stop</button>
+        </div>
+      </form>
+    </section>
+    <aside class="chat-side" id="chat-side"></aside>
   </div>
-</section>
-
-<section id="tokens" aria-label="tokens"></section>
-<div id="status"></div>
-
-<nav id="tabs"></nav>
-<main id="panel"></main>
+</div>
 
 <div id="loading">
   <div class="loadbox">
