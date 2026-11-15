@@ -1,0 +1,9 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2024"
+default-run = "smol"
+description = "A from-scratch, hook-everything inference engine for SmolLM2 (Llama architecture)"
+
+[dependencies]
+serde_json = "1"

@@ -1,0 +1,12 @@
+[workspace]
+members = ["engine", "viz", "wasm"]
+default-members = ["engine"]
+resolver = "3"
+
+# The forward pass is tight f32 loops; unoptimized builds are ~50x slower.
+# Optimize every profile so plain `cargo run` / `cargo test` are fast.
+[profile.dev]
+opt-level = 3
+
+[profile.test]
+opt-level = 3

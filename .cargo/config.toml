@@ -1,0 +1,3 @@
+# WebAssembly builds use 128-bit SIMD (supported by every current browser).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
