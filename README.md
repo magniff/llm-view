@@ -2,6 +2,9 @@
 
 **Watch a real language model think, one tensor at a time.**
 
+**▶ Try it live: [llm-view.magniff.dev](https://llm-view.magniff.dev)**. Everything runs in your browser; the first
+visit downloads the 270 MB model from Hugging Face, and later visits load it from the browser cache.
+
 llm-view is a from-scratch inference engine for [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct), written in Rust,
 plus a visualizer that runs entirely in your browser. Every intermediate tensor of the forward pass goes through a hook,
 so you can see the residual stream evolve, the attention heads at work, the KV cache filling up, and the next-token
