@@ -4,11 +4,14 @@
 // CDN (kept afterwards in the browser's Cache Storage, so later visits load
 // offline), or, for local development, from the dev server's /models/.
 //
-// Messages in:  {id, method, args}   (method "__load" {model, source: 'hf'|'local'} loads a model; anything else goes to Session::call)
+// Messages in:  {id, method, args}
+//   "__status" {model}: is the model already in the browser cache? (no network)
+//   "__load" {model, source: 'hf'|'local'}: download (or read from cache) and load it
+//   anything else goes to Session::call
 // Messages out: {id, ok, result | error}  and  {progress: {...}} while loading.
 
 const MODELS = {
-  'smollm2-135m-instruct': { repo: 'HuggingFaceTB/SmolLM2-135M-Instruct', sha256: '5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c' },
+  'smollm2-135m-instruct': { repo: 'HuggingFaceTB/SmolLM2-135M-Instruct', sha256: '5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c', bytes: 269060552 },
 };
 const CACHE = 'smollm2-files-v1';
 // Inspector positions. Its trace grows with N positions as ~0.33 MB·N (residual
@@ -66,9 +69,11 @@ async function openCache() {
 // so a reload reads it from disk instead of the network. A file with a pinned
 // checksum is cached under that checksum: the same weights from localhost or
 // from Hugging Face are one entry, and they're re-verified on every load.
+const weightsKey = (sha) => new URL(`/__weights/${sha}`, self.location.href).href;
+
 async function fetchBytes(url, label, sha) {
   const cache = await openCache();
-  const key = sha ? new URL(`/__weights/${sha}`, self.location.href).href : url;
+  const key = sha ? weightsKey(sha) : url;
   let resp = cache ? await cache.match(key) : null;
   const cached = !!resp;
   if (!resp) {
@@ -155,13 +160,23 @@ async function load(name, source) {
   return { name, max_seq: MAX_SEQ };
 }
 
+// Whether loading would hit the network: the page asks before a download.
+// Only the weights matter (config and tokenizer are a couple of MB).
+async function status(name) {
+  const m = MODELS[name];
+  if (!m) throw new Error(`unknown model ${name}`);
+  const cache = await openCache();
+  const hit = cache ? await cache.match(weightsKey(m.sha256)) : null;
+  return { cached: !!hit, cacheable: !!cache, bytes: m.bytes, repo: m.repo };
+}
+
 // ---------------------------------------------------------------- messages
 
 onmessage = async (e) => {
   const { id, method, args } = e.data;
   try {
-    const result = method === '__load'
-      ? await load(args.model, args.source)
+    const result = method === '__load' ? await load(args.model, args.source)
+      : method === '__status' ? await status(args.model)
       : JSON.parse(invoke(() => ex.call(...strIn(method), ...strIn(JSON.stringify(args ?? null)))));
     postMessage({ id, ok: true, result });
   } catch (err) {

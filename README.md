@@ -2,8 +2,9 @@
 
 **Watch a real language model think, one tensor at a time.**
 
-**▶ Try it live: [llm-view.magniff.dev](https://llm-view.magniff.dev)**. Everything runs in your browser; the first
-visit downloads the 270 MB model from Hugging Face, and later visits load it from the browser cache.
+**▶ Try it live: [llm-view.magniff.dev](https://llm-view.magniff.dev)**. Everything runs in your browser. The page opens
+right away and asks before it downloads anything: the first time you run a prompt, it offers to fetch the 269 MB model
+from Hugging Face, and later visits load it from the browser cache without asking.
 
 llm-view is a from-scratch inference engine for [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct), written in Rust,
 plus a visualizer that runs entirely in your browser. Every intermediate tensor of the forward pass goes through a hook,
@@ -36,6 +37,7 @@ It is built for learning: the engine is small enough to read in an afternoon, an
 | Tab | What you see |
 |---|---|
 | **Next token** | The model's distribution (blue) and what the sampler turns it into (orange). Drag temperature, top-p, top-k and the penalties and watch the bars move. Click a token to force it. |
+| **Flow** | One position's trip through the whole network. A map shows, layer by layer, which earlier tokens each attention write came from and how each layer moves the final answer; open any stage to see every vector it computes (q, k, v, RoPE, scores, each head, the MLP's gate/up/neurons, the residual adds) with the real numbers, and read any write as the tokens it pushes up. |
 | **Logit lens** | Project the residual stream onto the vocabulary after every layer: watch the answer form from the bottom up, see where it "locks in", and follow its probability layer by layer. |
 | **Attention** | Every head of every layer as a heatmap, grouped by the KV head they share (GQA). Ablate heads and re-run to see what breaks. |
 | **KV cache** | What's actually stored per layer and position, and why decoding one token is cheap. |
@@ -79,20 +81,29 @@ model itself, and `?native` makes the page use it instead of WebAssembly, which 
 
 ## Sampling defaults, measured
 
-A 135M model falls into loops easily ("I headed to the office… I headed to the office…"). The classic fix, a
-repetition penalty, is blunt: it also punishes words an answer *has* to repeat ("What is 7 + 5?" → "7 + 5 = 12"), and in
-chat it even penalizes `<|im_end|>`, the token that ends a reply, because every prompt contains it. So the defaults
-use **DRY**, which only penalizes a token that would *continue* a sequence that already appeared, harder the longer the
-repeat. `cargo run --release --example sampling_eval` produced this table:
+A 135M model has two bad habits in chat: it rambles, and it falls into loops ("a source of strength, a source of
+comfort, a source of joy…"). The usual fixes break other things. A repetition penalty strong enough to stop the
+rambling (1.2) wrecks arithmetic, because every digit is its own token here and "100 + 200 = 300" *has* to reuse
+the digits of the question. And DRY, the anti-loop sampler, read the echoed "100 + 20" as a loop and pushed the
+next "0" down: "100 + 201 = 301".
 
-| Setting | Short questions answered correctly | "How was your day?" loops | Long story loops |
-|---|---|---|---|
-| Model card (T 0.2, top-p 0.9) | 96% | 5 / 10 | 8 / 10 |
-| **Model card + DRY 0.8** (default) | **96%** | **0 / 10** | **0 / 10** |
-| Repetition penalty 1.1 | 92% | 0 / 10 | 3 / 10 |
-| DRY + repetition penalty 1.05 | 90% | 0 / 10 | 0 / 10 |
+So the chat defaults are: the model card's temperature 0.2 and top-p 0.9; **DRY 0.8 and a repetition penalty of 1.1
+that only apply to tokens containing a letter** (numbers, operators and punctuation are exempt: loops are made of
+words); and a **wrap-up bias** that, once a reply passes 40 tokens, raises the logit of `<|im_end|>` by 0.05 per
+extra token. `cargo run --release --example chat_tuning` produced this (10 arithmetic questions, 5 factual ones and
+6 open prompts like "What is love?", 10 seeds each, open replies capped at 300 tokens):
 
-Every knob is still adjustable in the UI, and the Next token view marks the tokens DRY pushed down (↺).
+| Setting | Arithmetic | Facts | Open replies: median length | ended on their own | looped |
+|---|---|---|---|---|---|
+| Greedy, no penalties (the model itself) | 70% | 100% | 300 | 33% | 50 / 60 |
+| Previous default (T 0.2, DRY 0.8 on everything) | 43% | 100% | 293 | 51% | 2 / 60 |
+| Repetition penalty 1.2 (on everything) | 13% | 60% | 224 | 77% | 0 / 36 |
+| **Default: DRY + rep 1.1 on words, wrap-up 0.05** | **65%** | **100%** | **188** | **100%** | **0 / 60** |
+| Same at temperature 0 | 70% | 100% | 219 | 100% | 0 / 60 |
+
+The arithmetic ceiling is the model's, not the engine's: the golden tests check that greedy chat replies, including
+"What is 45 - 17?" (to which HF's own `transformers` answers 32), match `transformers` token for token. Every knob is
+adjustable in the UI, and the Next token view marks the tokens DRY pushed down (↺).
 
 ## How a token flows through the model
 
@@ -133,12 +144,13 @@ engine/          the inference engine (library + `smol` CLI)
     generate.rs      prefill + decode loop, streaming UTF-8
     chat.rs          ChatML template, multi-turn conversations
     trace.rs         records a session by position; the logit lens
+    flow.rs          one position through one layer in full, and where each write came from
     session.rs       the visualizer's API: method + JSON args → JSON
   tests/           golden tests against HF, session API tests
 wasm/            the engine compiled for the browser (raw ABI, no wasm-bindgen)
 viz/
   src/main.rs      dev server (axum): static files, /models, optional native API
-  web/             the static site: app.js (views), worker.js (engine in a Web Worker)
+  web/             the static site: app.js (views), flow.js (the Flow tab), worker.js (engine in a Web Worker)
 reference/       Python scripts that produce the golden data from `transformers`
 scripts/         build-web.sh, test-wasm.mjs
 ```
@@ -165,6 +177,8 @@ python -m venv .venv && .venv/bin/pip install torch transformers tokenizers safe
 - Attention sinks: many heads park their attention on the first token when they have nothing to do.
 - How the answer emerges in the middle layers (logit lens), and which heads matter (ablation).
 - What temperature, top-p and penalties actually do to a distribution, and why a tiny model loops without them.
+- Where an answer comes from: in "The capital of France is Paris. The capital of Germany is", layer 23's attention copies
+  " Germany" into the last position, and that one write lifts the logit of " Berlin" by more than 5 (Flow tab).
 
 ## Credits
 

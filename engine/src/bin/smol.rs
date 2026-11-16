@@ -121,16 +121,15 @@ fn main() -> engine::Result<()> {
     let model = Model::load(&dir)?;
     let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json"))?;
     // Chat: the model card's settings (0.2 / top-p 0.9). Completion: a bit livelier.
-    // Both use DRY against loops rather than a repetition penalty, which also
-    // punishes words an answer has to repeat.
+    // Both use DRY against loops; penalties apply to words only, so answers can
+    // repeat numbers (see examples/chat_tuning.rs).
     let temp = a.temp.unwrap_or(if a.complete { 0.8 } else { 0.2 });
     let specials: Vec<u32> = tok.specials.iter().map(|&(_, id)| id).collect();
     let mut sampler = Sampler::new(temp, a.top_k, a.top_p, a.seed)
-        .with_dry(model.cfg.vocab, |id| specials.contains(&id) || Sampler::dry_breaker_bytes(&tok.decode_bytes(&[id])));
+        .with_dry(model.cfg.vocab, |id| specials.contains(&id) || Sampler::dry_breaker_bytes(&tok.decode_bytes(&[id])))
+        .words_only(model.cfg.vocab, &specials, |id| tok.decode_bytes(&[id]));
     sampler.dry_multiplier = a.dry;
     sampler.repeat_penalty = a.repeat_penalty.unwrap_or(1.0);
-    // Never penalize control tokens: every chat prompt contains <|im_end|>.
-    sampler.no_penalty = specials;
     let stop: Vec<u32> = [model.cfg.eos_token, 0].into_iter().collect(); // EOS and <|endoftext|>
 
     eprintln!(

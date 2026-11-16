@@ -244,6 +244,7 @@ function tokenOverlay() {
 
 function renderTokens() {
   const box = $('#tokens');
+  if (!S.st) { box.replaceChildren(el('span', { class: 'dim', text: 'tokens appear here once the prompt has run' })); return; }
   const w = tokenOverlay();
   const max = w ? Math.max(...w) : 1;
   // Tokens that weren't in the strip last time pop in, one after another.
@@ -295,6 +296,7 @@ function renderStatus() {
 
 const TABS = [
   ['next', 'Next token', viewNext],
+  ['flow', 'Flow', viewFlow],
   ['lens', 'Logit lens', viewLens],
   ['attn', 'Attention', viewAttn],
   ['kv', 'KV cache', viewKV],
@@ -302,6 +304,7 @@ const TABS = [
 ];
 
 const TAB_ICONS = {
+  flow: 'M3 14V2M3 10c4 0 6-6 10-6M3 10c4 0 6 2 10 2',
   lens: 'M2 3h12M2 6.5h12M2 10h12M2 13.5h7',
   attn: 'M3 13 8 3l5 10M5 9h6',
   resid: 'M2 12c2-6 4-6 6-3s4 3 6-4',
@@ -351,6 +354,7 @@ addEventListener('resize', () => document.querySelectorAll('#tabs, #modes').forE
 async function renderTab() {
   const gen = ++S.renderGen;
   const panel = $('#panel');
+  if (!S.st) { panel.replaceChildren(viewNoModel()); return; }
   const view = TABS.find((t) => t[0] === S.tab)[2];
   // Slow views (the logit lens on a long prompt) get a note instead of a frozen page.
   const slow = setTimeout(() => {
@@ -867,7 +871,10 @@ async function viewKV() {
 
 function samplingDist(top, lse) {
   const s = samp(), cfg = S.st.sampler;
-  const recent = new Set(S.st.tokens.slice(-cfg.repeat_window).filter((t) => !t.special).map((t) => t.id));
+  // The engine penalizes only tokens with a letter in them (or non-ASCII text):
+  // digits, operators and punctuation have to repeat in answers like "100 + 200 = 300".
+  const wordy = (t) => /[A-Za-z]|[^\x00-\x7F]/.test(t.text);
+  const recent = new Set(S.st.tokens.slice(-cfg.repeat_window).filter((t) => !t.special && wordy(t)).map((t) => t.id));
   // DRY: the engine reports, per token, the length of the repeat it would extend;
   // the penalty for the slider's strength is computed here, so dragging is live.
   const dryLen = new Map(S.st.next.dry || []);
@@ -926,15 +933,46 @@ async function viewNext() {
   ];
 }
 
-// ------------------------------------------------------------------ loading screen
+// ------------------------------------------------------------------ model download
+//
+// The page opens straight into the UI without fetching the weights. The first
+// action that needs the engine calls ensureModel(): if the weights are already
+// in the browser cache it just loads them, otherwise it asks first.
 
-function showLoading(on, error) {
-  $('#loading').style.display = on ? 'flex' : 'none';
-  if (error) {
-    $('#load-stage').textContent = 'Could not load the model';
-    $('#load-detail').textContent = error;
-    $('#load-bar').style.width = '0';
-  }
+let READY = false;   // the engine is loaded
+let MODEL_INFO = null; // worker's __status: {cached, cacheable, bytes, repo}
+let loading = null;  // the in-flight ensureModel() promise
+const mb = (b) => `${Math.round(b / 1e6)} MB`;
+
+function overlay(which) {
+  $('#loading').style.display = which ? 'flex' : 'none';
+  $('#consent').hidden = which !== 'consent';
+  $('#progress').hidden = which !== 'progress';
+}
+
+// Resolves true if the visitor agrees to the download.
+function askDownload() {
+  const i = MODEL_INFO, size = mb(i.bytes);
+  $('#consent-size').textContent = size;
+  $('#consent-yes').lastChild.textContent = `Download ${size}`;
+  $('#consent-src').textContent = SOURCE === 'local' ? 'this dev server (localhost)' : 'Hugging Face';
+  $('#consent-cache').textContent = i.cacheable
+    ? "It's kept in your browser's cache, so later visits start in about a second."
+    : "This browser won't let the page cache it (private window, or not HTTPS), so it downloads again on every visit.";
+  overlay('consent');
+  $('#consent-yes').focus();
+  return new Promise((resolve) => {
+    const done = (ok) => {
+      overlay(null);
+      $('#consent-yes').onclick = $('#consent-no').onclick = null;
+      removeEventListener('keydown', onKey, true);
+      resolve(ok);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); done(false); } };
+    $('#consent-yes').onclick = () => done(true);
+    $('#consent-no').onclick = () => done(false);
+    addEventListener('keydown', onKey, true);
+  });
 }
 
 function showProgress(p) {
@@ -946,10 +984,269 @@ function showProgress(p) {
     : p.total ? `${p.got} / ${p.total}` : '';
 }
 
+// Shows the error and waits: true = retry, false = give up.
+function showLoadError(msg) {
+  $('#load-stage').textContent = 'Could not load the model';
+  $('#load-detail').textContent = msg;
+  $('#load-bar').style.width = '0';
+  $('#load-fail').hidden = false;
+  return new Promise((resolve) => {
+    const done = (retry) => { $('#load-fail').hidden = true; resolve(retry); };
+    $('#load-retry').onclick = () => done(true);
+    $('#load-close').onclick = () => done(false);
+  });
+}
+
+// Load the engine, asking before any download. Resolves true when it's ready,
+// false if the visitor said no (the action that asked is then dropped).
+function ensureModel({ ask = true } = {}) {
+  if (READY) return Promise.resolve(true);
+  return (loading ??= (async () => {
+    try {
+      if (!MODEL_INFO.cached && ask && !(await askDownload())) return false;
+      for (;;) {
+        overlay('progress');
+        showProgress({ stage: MODEL_INFO.cached ? 'reading the model from the browser cache' : 'starting', got: 0, total: 0 });
+        try {
+          await call('__load', { model: MODEL, source: SOURCE });
+          break;
+        } catch (e) {
+          // A failed load leaves a fresh worker behind, so a retry starts clean.
+          worker.terminate(); startWorker(showProgress);
+          if (!(await showLoadError(e.message))) { overlay(null); return false; }
+        }
+      }
+      overlay(null);
+      await onModelReady();
+      return true;
+    } finally {
+      loading = null;
+    }
+  })());
+}
+
+// The engine starts on its own default prompt and chat; bring it in line with
+// whatever the visitor typed before it was loaded.
+async function onModelReady() {
+  READY = true;
+  MODEL_INFO.cached = true;
+  renderModelChip();
+  let st = await call('state');
+  const text = $('#prompt').value;
+  if (text && text !== st.tokens.map((t) => t.text).join('')) st = await call('run', { text });
+  setState(st, 'last');
+  C.st = await call('chat_state');
+  if (!$('#c-system').value.trim()) $('#c-system').value = C.st.system;
+  else if ($('#c-system').value !== C.st.system) C.st = await call('chat_reset', { system: $('#c-system').value });
+  renderChatSide();
+}
+
+// Before the model is loaded, the header offers the download instead of stats.
+function renderModelChip() {
+  const box = $('#model-info');
+  if (READY) { if (box.querySelector('.getmodel')) box.replaceChildren(); return; }
+  box.replaceChildren(el('button', {
+    class: 'getmodel', title: MODEL_INFO.cached ? 'load SmolLM2-135M-Instruct from the browser cache' : `download SmolLM2-135M-Instruct (${mb(MODEL_INFO.bytes)}) and run it in this tab`,
+    onclick: () => ensureModel(),
+  }, svgIcon('M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10'), MODEL_INFO.cached ? 'Load model' : `Get the model · ${mb(MODEL_INFO.bytes)}`));
+}
+
+// What the completion view shows before there is any engine state.
+function viewNoModel() {
+  const dl = !MODEL_INFO || !MODEL_INFO.cached;
+  return el('div', { class: 'nomodel' },
+    el('div', { class: 'empty-orb', 'aria-hidden': 'true' }),
+    el('h2', { text: 'The model isn’t loaded yet' }),
+    el('p', { class: 'dim', text: dl
+      ? `Run the prompt above (or press Step) and the page will offer to download SmolLM2-135M-Instruct: ${mb(MODEL_INFO ? MODEL_INFO.bytes : 269060552)}, once, then cached in your browser. Every view below is computed from the real model in this tab.`
+      : 'It’s in your browser cache already; run the prompt to load it.' }),
+    el('button', { class: 'primary', onclick: () => $('#run').click() }, svgIcon('M4 2.5v11l9-5.5z'), dl ? 'Download & run the prompt' : 'Load & run the prompt'));
+}
+
+// ------------------------------------------------------------------ about the model
+//
+// A static description of SmolLM2-135M-Instruct, from its config.json and
+// model card, so it can be read before the weights are downloaded.
+
+const CFG = {
+  vocab: 49152, hidden: 576, layers: 30, heads: 9, kv_heads: 3, head_dim: 64, inter: 1536,
+  ctx: 8192, rope_theta: 100000, merges: 48900, specials: 17,
+};
+const P = (() => {
+  const { vocab, hidden: d, inter, kv_heads, head_dim, layers } = CFG, kv = kv_heads * head_dim;
+  const embed = vocab * d, attn = 2 * d * d + 2 * d * kv, mlp = 3 * d * inter, norms = 2 * d;
+  return { embed, attn, mlp, norms, layer: attn + mlp + norms, total: embed + layers * (attn + mlp + norms) + d };
+})();
+const M = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e8 ? 1 : 2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + 'k' : String(n));
+
+// Close the dialog and show one of the completion tabs.
+function gotoTab(id) {
+  $('#info').close();
+  if (MODE !== 'complete') setMode('complete');
+  const b = document.querySelector(`#tabs button[data-tab="${id}"]`);
+  if (b && !b.classList.contains('active')) b.click();
+}
+
+function buildInfo() {
+  const c = CFG, kvBytes = c.layers * 2 * c.kv_heads * c.head_dim * 4;
+  const see = (tab, name) => el('button', { class: 'see', type: 'button', onclick: () => gotoTab(tab), title: `close this and open the ${name} tab` }, name + ' →');
+  const stat = (v, label, hint) => el('div', { class: 'stat', title: hint || '' }, el('b', { text: v }), el('span', { text: label }));
+  const shape = (s) => el('code', { class: 'shape', text: s });
+  const box = (cls, name, what, sh, link) => el('div', { class: 'blk ' + cls }, el('div', {}, el('b', { text: name }), el('span', { class: 'dim', text: what })), el('div', { class: 'blkr' }, sh ? shape(sh) : null, link));
+  const arrow = () => el('div', { class: 'arr', 'aria-hidden': 'true' });
+  const feat = (title, ...body) => el('li', {}, el('b', { text: title }), ' ', ...body);
+  const share = [
+    ['MLP (SwiGLU)', c.layers * P.mlp, 'mlp'],
+    ['token embedding (shared with the output head)', P.embed, 'emb'],
+    ['attention (q, k, v, o)', c.layers * P.attn, 'att'],
+    ['RMSNorm scales', c.layers * P.norms + c.hidden, 'nrm'],
+  ];
+
+  return [
+    el('div', { class: 'info-head' },
+      el('div', {},
+        el('h2', { id: 'info-title' }, 'SmolLM2-135M-', el('span', { class: 'grad', text: 'Instruct' })),
+        el('div', { class: 'dim' }, 'by Hugging Face · Apache 2.0 · Llama architecture · ',
+          el('a', { href: 'https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct', target: '_blank', rel: 'noopener', text: 'model card' }), ' · ',
+          el('a', { href: 'https://arxiv.org/abs/2502.02737', target: '_blank', rel: 'noopener', text: 'paper' }))),
+      el('button', { class: 'icon close', type: 'button', autofocus: true, 'aria-label': 'Close', title: 'Close (Esc)', onclick: () => $('#info').close() },
+        svgIcon('M4 4l8 8M12 4l-8 8'))),
+
+    el('div', { class: 'stats' },
+      stat(`${(P.total / 1e6).toFixed(1)}M`, 'parameters', `${P.total.toLocaleString()} exactly`),
+      stat(String(c.layers), 'layers'),
+      stat(String(c.hidden), 'model width', 'd_model: the size of the residual stream vector at every position'),
+      stat(`${c.heads} / ${c.kv_heads}`, 'query / KV heads', `${c.head_dim} dimensions per head`),
+      stat(c.inter.toLocaleString(), 'MLP hidden'),
+      stat(c.vocab.toLocaleString(), 'vocabulary'),
+      stat(c.ctx.toLocaleString(), 'context (trained)'),
+      stat('2T', 'training tokens')),
+
+    el('p', { class: 'dim small gloss-hint' }, 'New to some of these words? ', el('button', { class: 'see', type: 'button', onclick: () => showInfoView('glossary') }, 'Open the glossary →')),
+    el('h3', { text: 'Structure' }),
+    el('p', { class: 'dim', text: `A decoder-only transformer. Every position carries one ${c.hidden}-number vector (the residual stream); each layer reads it through a norm and adds its result back. T is the number of tokens.` }),
+    el('div', { class: 'arch' },
+      box('io', 'Tokenizer', 'text → token ids (byte-level BPE)', '[T]', see('next', 'Next token')),
+      arrow(),
+      box('emb', 'Token embedding', `look up row id of a ${c.vocab.toLocaleString()} × ${c.hidden} table`, `[T, ${c.hidden}]`, see('resid', 'Residual stream')),
+      arrow(),
+      el('div', { class: 'loop' },
+        el('div', { class: 'loop-tag', text: `× ${c.layers} layers` }),
+        box('nrm', 'RMSNorm', `scale x to unit RMS, then by a learned ${c.hidden}-vector`, null),
+        arrow(),
+        box('att', 'Grouped-query self-attention', `q: ${c.heads} heads, k & v: ${c.kv_heads} heads, ${c.head_dim} dims each · RoPE on q and k · causal mask · softmax(q·kᵀ/√${c.head_dim})·v · output projection`, `[T, ${c.hidden}]`, see('attn', 'Attention')),
+        el('div', { class: 'add', text: '+ add back into the residual stream' }),
+        box('nrm', 'RMSNorm', 'a second, separate norm', null),
+        arrow(),
+        box('mlp', 'SwiGLU MLP', `down( silu(gate·x) ⊙ up·x ): ${c.hidden} → ${c.inter.toLocaleString()} → ${c.hidden}, per position`, `[T, ${c.hidden}]`, null),
+        el('div', { class: 'add', text: '+ add back into the residual stream' })),
+      arrow(),
+      box('nrm', 'Final RMSNorm', '', `[T, ${c.hidden}]`, see('lens', 'Logit lens')),
+      arrow(),
+      box('emb', 'Output head (tied)', 'dot product with every row of the embedding table', `[T, ${c.vocab.toLocaleString()}]`, null),
+      arrow(),
+      box('io', 'Softmax + sampler', 'logits → probabilities → one token', '1 token', see('next', 'Next token'))),
+
+    el('h3', { text: 'Where the parameters are' }),
+    el('div', { class: 'share' }, share.map(([name, n, cls]) => el('div', { class: 'srow' },
+      el('span', { text: name }),
+      el('div', { class: 'sbar' }, el('i', { class: cls, style: `width:${Math.max(0.6, (100 * n) / P.total).toFixed(1)}%` })),
+      el('span', { class: 'mono', text: `${M(n)} · ${((100 * n) / P.total).toFixed(n / P.total < 0.01 ? 2 : 0)}%` })))),
+    el('p', { class: 'dim small', text: `Each layer holds ${M(P.layer)} parameters: ${M(P.attn)} in attention, ${M(P.mlp)} in the MLP. At this size the embedding table is a fifth of the model, which is why it's shared with the output head instead of stored twice.` }),
+
+    el('h3', { text: 'Design choices' }),
+    el('ul', { class: 'feats' },
+      feat('Pre-norm with RMSNorm.', `Each sublayer normalizes its input (ε = 10⁻⁵) and adds its output back, so the residual stream is a running sum. No biases anywhere in the model.`),
+      feat('Rotary position embeddings (RoPE).', `Position isn't added to the input; q and k are rotated by an angle that grows with position (base θ = ${c.rope_theta.toLocaleString()}, rotate-half layout), so q·k depends on the distance between tokens.`),
+      feat('Grouped-query attention.', `${c.heads} query heads share ${c.kv_heads} key/value heads, three per group. The KV cache is 3× smaller: ${(kvBytes / 1e3).toFixed(0)} KB per token here (f32), ${(kvBytes / 2e3).toFixed(0)} KB in the original bf16.`, ' ', see('kv', 'KV cache')),
+      feat('SwiGLU MLP.', `Two parallel projections up to ${c.inter.toLocaleString()}; one goes through SiLU and gates the other element-wise, then a third projects back down. It holds most of the parameters.`),
+      feat('Tied embeddings.', `The output head is the embedding table itself, which saves ${M(P.embed)} parameters.`),
+      feat('Deep and narrow.', `${c.layers} layers of width ${c.hidden}: a deep, narrow shape, common for models under a billion parameters.`)),
+
+    el('h3', { text: 'Tokenizer and chat format' }),
+    el('ul', { class: 'feats' },
+      feat('Byte-level BPE,', `${c.vocab.toLocaleString()} tokens built from ${c.merges.toLocaleString()} merges. Any byte sequence can be encoded, so there's no "unknown" token. Digits are always split one per token.`),
+      feat(`${c.specials} special tokens`, 'at ids 0–16, mostly for code (<file_sep>, <jupyter_code>…). The ones chat uses: <|endoftext|> (0), <|im_start|> (1), <|im_end|> (2, which ends a reply).'),
+      feat('ChatML.', 'A conversation is plain text the model completes:')),
+    el('pre', { class: 'chatml' },
+      el('span', { class: 'sp', text: '<|im_start|>' }), 'system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face', el('span', { class: 'sp', text: '<|im_end|>' }), '\n',
+      el('span', { class: 'sp', text: '<|im_start|>' }), 'user\nWhat is the capital of France?', el('span', { class: 'sp', text: '<|im_end|>' }), '\n',
+      el('span', { class: 'sp', text: '<|im_start|>' }), 'assistant\n', el('span', { class: 'gen', text: 'The capital of France is Paris.' }), el('span', { class: 'sp', text: '<|im_end|>' })),
+
+    el('h3', { text: 'Training' }),
+    el('ul', { class: 'feats' },
+      feat('Pretraining:', '2 trillion tokens of FineWeb-Edu, DCLM and The Stack, plus new filtered datasets; bfloat16, on 64 H100s with nanotron.'),
+      feat('Instruct tuning:', 'supervised fine-tuning on smol-smoltalk, then Direct Preference Optimization (DPO) on UltraFeedback.'),
+      feat('Limits:', 'mostly English. At 135M parameters it’s fluent but often wrong, and it loops easily without an anti-repetition sampler.')),
+
+    el('h3', { text: 'In this engine' }),
+    el('ul', { class: 'feats' },
+      feat('Weights', `are stored in bfloat16 (${Math.round((P.total * 2) / 1e6)} MB) and converted to f32 on load (${Math.round((P.total * 4) / 1e6)} MB in memory).`),
+      feat('Context:', `chat holds 2,048 positions and the completion inspector 512 (it records every activation at every position); the model itself was trained on ${c.ctx.toLocaleString()}.`),
+      feat('Sampling defaults:', 'chat uses the model card’s temperature 0.2 and top-p 0.9, plus DRY 0.8 against loops; completion uses temperature 0.7.')),
+  ];
+}
+
+// The glossary (glossary.js): grouped entries with a filter box.
+function buildGlossary() {
+  const list = el('div', { class: 'gloss' });
+  const empty = el('p', { class: 'dim', hidden: true, text: 'No term matches.' });
+  const items = GLOSSARY.map((g) => {
+    const node = el('div', { class: 'gitem', id: 'g-' + g.t.toLowerCase().replace(/[^a-z0-9]+/g, '-') },
+      el('div', { class: 'gterm' }, el('b', { text: g.t }), g.tab ? el('button', { class: 'see', type: 'button', onclick: () => gotoTab(g.tab), title: 'close this and open that tab' },
+        'see it: ' + TABS.find((t) => t[0] === g.tab)[1] + ' →') : null),
+      el('p', { text: g.d }),
+      el('div', { class: 'glinks' }, g.l.map(([label, href]) => el('a', { href, target: '_blank', rel: 'noopener' }, label, ' ↗'))));
+    return { g, node, hay: [g.t, g.aka || '', g.d].join(' ').toLowerCase() };
+  });
+  const sections = GLOSSARY_GROUPS.map((name) => {
+    const mine = items.filter((i) => i.g.g === name);
+    return { mine, node: el('section', {}, el('h3', { text: name }), mine.map((i) => i.node)) };
+  });
+  list.append(...sections.map((s) => s.node));
+  const search = el('input', { type: 'search', class: 'gsearch', placeholder: `Filter ${GLOSSARY.length} terms… (e.g. cache, softmax, rope)`, 'aria-label': 'Filter the glossary' });
+  search.oninput = () => {
+    const words = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+    let shown = 0;
+    for (const i of items) { const ok = words.every((w) => i.hay.includes(w)); i.node.hidden = !ok; shown += ok; }
+    for (const s of sections) s.node.hidden = s.mine.every((i) => i.node.hidden);
+    empty.hidden = shown > 0;
+  };
+  return [
+    el('p', { class: 'dim', text: 'The words this page uses, explained for this model, with links for digging deeper. Terms with a "see it" button can be watched live in one of the tabs.' }),
+    search, empty, list,
+  ];
+}
+
+// view: 'model' or 'glossary'
+function openInfo(view = 'model') {
+  const d = $('#info');
+  if (!d.childElementCount) {
+    const [head, ...model] = buildInfo();
+    const tabs = el('div', { class: 'info-tabs', role: 'tablist' },
+      el('button', { type: 'button', 'data-view': 'model', role: 'tab', text: 'The model' }),
+      el('button', { type: 'button', 'data-view': 'glossary', role: 'tab', text: `Glossary (${GLOSSARY.length})` }));
+    tabs.onclick = (e) => { const v = e.target.closest('button')?.dataset.view; if (v) showInfoView(v); };
+    d.append(head, tabs, el('div', { id: 'info-model' }, model.flat(Infinity)), el('div', { id: 'info-gloss', hidden: true }, buildGlossary()));
+    d.addEventListener('click', (e) => { if (e.target === d) d.close(); }); // click on the backdrop
+  }
+  hideTip();
+  showInfoView(view);
+  d.showModal();
+}
+
+function showInfoView(view) {
+  const d = $('#info');
+  $('#info-model').hidden = view !== 'model';
+  $('#info-gloss').hidden = view !== 'glossary';
+  d.querySelectorAll('.info-tabs button').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.view === view)));
+  d.scrollTop = 0;
+}
+$('#info-btn').onclick = () => openInfo();
+
 // ------------------------------------------------------------------ modes
 
 let MODE = 'complete';
-let READY = false; // the engine is loaded
 
 function setMode(mode) {
   MODE = mode;
@@ -991,6 +1288,7 @@ function chatSamp() {
     top_p: numIn('#c-topp', 1, 0, 1),
     repeat_penalty: numIn('#c-rep', 1, 0.01, 100),
     dry: numIn('#c-dry', 0, 0, 100),
+    end_bias: numIn('#c-end', 0, 0, 10),
   };
 }
 
@@ -1066,6 +1364,8 @@ function renderChatBubbles() {
       el('div', { class: 'empty-orb', 'aria-hidden': 'true' }),
       el('h2', { text: 'Chat with SmolLM2-135M-Instruct' }),
       el('p', { class: 'dim', text: 'A tiny model (135M parameters) running in this tab: fluent and quick, but often wrong. Hover any word of a reply to see what else it considered.' }),
+      !READY && MODEL_INFO && !MODEL_INFO.cached
+        ? el('p', { class: 'dim small', text: `Your first message downloads the model (${mb(MODEL_INFO.bytes)}, once). The page asks before it does.` }) : null,
       el('div', { class: 'ideas' }, ideas.map((t) => el('button', { class: 'idea', text: t, onclick: () => { $('#chat-input').value = t; sendChat(); } })))));
     return;
   }
@@ -1099,11 +1399,7 @@ function renderChatSide() {
 
 async function refreshChat() {
   C.st = await call('chat_state');
-  const s = C.st.sampler;
-  setRange('#c-temp', s.temperature);
-  setRange('#c-topp', s.top_p);
-  setRange('#c-rep', s.repeat_penalty);
-  setRange('#c-dry', s.dry);
+  // The sliders are the source of truth: every chat_step sends them.
   if (!$('#c-system').value) $('#c-system').value = C.st.system;
   renderChatSide();
   // Bubbles are built incrementally while chatting; only the raw view is redrawn from state.
@@ -1120,7 +1416,8 @@ function setChatBusy(on) {
 async function sendChat() {
   const input = $('#chat-input');
   const text = input.value.trim();
-  if (!text || C.busy || !READY) return;
+  if (!text || C.busy) return;
+  if (!READY && (!(await ensureModel()) || C.busy)) return; // C.busy: a second Enter while it loaded
   input.value = '';
   setChatBusy(true);
   C.stopRequested = false;
@@ -1161,6 +1458,7 @@ async function sendChat() {
 
 async function newChat() {
   if (C.busy) return;
+  if (!READY) { chatLog = []; renderMessages(); $('#chat-input').focus(); return; }
   C.st = await call('chat_reset', { system: $('#c-system').value });
   chatLog = [];
   renderChatSide();
@@ -1210,10 +1508,11 @@ function setupChat() {
     el('div', { class: 'knobs stack' },
       knob('c-temp', 'temperature', 0, 2, 0.05, 0.2, 'Divide the logits by this before softmax. 0 = always the top token', { zero: 'greedy' }),
       knob('c-topp', 'top-p', 0, 1, 0.01, 0.9, 'Keep the smallest set of tokens whose probabilities add up to p', { max: 'off' }),
-      knob('c-dry', 'anti-loop (DRY)', 0, 2, 0.05, 0.8, 'Push down a token that would continue a sequence that already appeared, harder the longer the repeat', { zero: 'off' }),
-      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1.0, 'Push down tokens used in the last 64 positions', { min: 'off' })),
+      knob('c-dry', 'anti-loop (DRY)', 0, 2, 0.05, 0.8, 'Push down a word that would continue a sequence that already appeared, harder the longer the repeat. Numbers and punctuation are exempt', { zero: 'off' }),
+      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1.1, 'Push down words used in the last 64 positions. Numbers and punctuation are exempt, so arithmetic still works', { min: 'off' }),
+      knob('c-end', 'wrap-up', 0, 0.2, 0.01, 0.05, 'After 40 tokens, raise the chance of ending the reply by this much (in logits) per extra token: keeps answers from rambling', { zero: 'off' })),
     el('h3', { text: 'system prompt' }),
-    el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false' }),
+    el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false', text: 'You are a helpful AI assistant named SmolLM, trained by Hugging Face' }),
     el('button', { class: 'wide', text: 'New chat', title: 'clear the conversation (applies the system prompt)', onclick: () => newChat() }));
 
   $('#composer').onsubmit = (e) => { e.preventDefault(); sendChat(); };
@@ -1227,9 +1526,16 @@ function setupChat() {
 
 // ------------------------------------------------------------------ wiring
 
-$('#run').onclick = () => act(async () => setState(await call('run', { text: $('#prompt').value }), 'last'));
-$('#step').onclick = () => act(async () => setState(await call('step', { n: 1, ...samp() }), 'last'));
-$('#gen').onclick = () => act(async () => setState(await call('step', { n: 16, ...samp() }), 'last'));
+// Each needs the engine; ensureModel() runs the typed prompt as part of loading,
+// so a fresh Run doesn't need to run it again.
+$('#run').onclick = () => withModel((fresh) => fresh || act(async () => setState(await call('run', { text: $('#prompt').value }), 'last')));
+$('#step').onclick = () => withModel(() => act(async () => setState(await call('step', { n: 1, ...samp() }), 'last')));
+$('#gen').onclick = () => withModel(() => act(async () => setState(await call('step', { n: 16, ...samp() }), 'last')));
+async function withModel(fn) {
+  if (READY) return fn(false);
+  if (S.busy) return;
+  if (await ensureModel()) return fn(true);
+}
 $('#prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('#run').click(); } });
 for (const id of ['#temp', '#topp', '#topk', '#rep', '#dry']) $(id).addEventListener('input', () => { if (S.tab === 'next') renderTab(); });
 document.addEventListener('keydown', (e) => {
@@ -1247,25 +1553,24 @@ document.addEventListener('keydown', (e) => {
   if (TABS.some((t) => t[0] === fromHash)) S.tab = fromHash;
   renderTabs();
   setupChat();
+  document.querySelectorAll('input[type=range]').forEach(syncRange);
   setMode(fromHash === 'chat' ? 'chat' : 'complete');
   try {
-    $('#chat-input').disabled = true;
-    if (!NATIVE) {
-      showLoading(true);
-      startWorker(showProgress);
-      await call('__load', { model: MODEL, source: SOURCE });
-      showLoading(false);
+    if (NATIVE) {
+      MODEL_INFO = { cached: true };
+      await onModelReady();
+      return;
     }
-    READY = true;
-    $('#chat-input').disabled = false;
-    const st = await call('state');
-    const s = st.sampler;
-    setRange('#temp', s.temperature); setRange('#topp', s.top_p); setRange('#topk', s.top_k); setRange('#rep', s.repeat_penalty); setRange('#dry', s.dry);
-    $('#prompt').value = st.tokens.map((t) => t.text).join('');
-    setState(st, 'last');
-    if (MODE === 'chat') await refreshChat();
+    startWorker(showProgress);
+    MODEL_INFO = await call('__status', { model: MODEL });
+    renderModelChip();
+    renderTokens();
+    renderTab();
+    if (!chatLog.length) renderMessages();
+    // Already downloaded on an earlier visit: load it straight away, no questions.
+    if (MODEL_INFO.cached) await ensureModel({ ask: false });
   } catch (e) {
-    showLoading(true, e.message);
     flash(e.message);
+    console.error(e);
   }
 })();

@@ -297,3 +297,109 @@ fn bad_requests_are_errors_not_panics() {
     ok(&mut s, "rewind", json!({"len": 0}));
     ok(&mut s, "rewind", json!({"len": 100000}));
 }
+
+/// The Flow view recomputes one position through one layer from the trace and
+/// the KV cache; it must land exactly where the real forward pass did, and its
+/// decompositions must add up.
+#[test]
+fn flow_recomputes_the_forward_pass() {
+    let mut s = session();
+    let mut args = GREEDY();
+    args["n"] = json!(3);
+    ok(&mut s, "step", args); // decode steps too, not just the prefill
+    let st = ok(&mut s, "state", json!(null));
+    let n = st["tokens"].as_array().unwrap().len();
+    let f = |v: &Value| v.as_f64().unwrap();
+    let norm = |v: &Value| v.as_array().unwrap().iter().map(|x| f(x) * f(x)).sum::<f64>().sqrt();
+    for &pos in &[0, 5, n - 1] {
+        for layer in [0, 11, 29] {
+            let r = ok(&mut s, "flow_layer", json!({"layer": layer, "pos": pos}));
+            let scale = norm(&r["x_out"]).max(1.0);
+            let check = r["check"].as_array().unwrap();
+            assert!(f(&check[0]) / scale < 1e-4 && f(&check[1]) / scale < 1e-4, "L{layer} pos {pos}: {check:?}");
+            // attention probabilities match the trace's attention maps
+            let a = ok(&mut s, "attn", json!({"layer": layer}));
+            for h in [0, 8] {
+                let mine = r["heads"][h]["probs"].as_array().unwrap();
+                let traced = a["heads"][h][pos].as_array().unwrap();
+                assert_eq!(mine.len(), pos + 1);
+                for (x, y) in mine.iter().zip(traced) {
+                    assert!((f(x) - f(y)).abs() < 1e-3);
+                }
+            }
+            // the (head, source) split adds up to ‖attention write‖
+            let total: f64 = r["src_total"].as_array().unwrap().iter().map(f).sum();
+            let dn = norm(&r["d_attn"]);
+            assert!((total - dn).abs() < 1e-3 * dn.max(1.0), "src {total} vs ‖Δ‖ {dn}");
+        }
+        // per-layer sources (from the trace) agree with the per-layer recompute
+        let m = ok(&mut s, "flow_map", json!({"pos": pos}));
+        let attn_write = &st["attn_write"];
+        for layer in [0, 11, 29] {
+            let total: f64 = m["src"][layer].as_array().unwrap().iter().map(f).sum();
+            let w = f(&attn_write[layer][pos]);
+            assert!((total - w).abs() < 1e-3 * w.max(1.0), "map L{layer}: {total} vs {w}");
+        }
+        // direct logit attribution adds up to the answer's logit
+        let attrib: f64 = m["attrib"].as_array().unwrap().iter().map(|a| f(&a[0])).sum();
+        let out = ok(&mut s, "flow_out", json!({"pos": pos}));
+        assert_eq!(out["top"][0][0], m["answer"][0]);
+        assert!((attrib - f(&out["top"][0][2])).abs() < 1e-2, "{attrib} vs {}", out["top"][0][2]);
+        assert!((f(&m["answer"][2]) - f(&out["top"][0][2])).abs() < 1e-2);
+    }
+    let e = ok(&mut s, "flow_embed", json!({"pos": 1}));
+    assert_eq!(e["vec"].as_array().unwrap().len(), 576);
+    assert_eq!(e["nearest"].as_array().unwrap().len(), 10);
+    assert!(s.call("flow_layer", &json!({"layer": 30, "pos": 0})).is_err());
+    assert!(s.call("flow_map", &json!({"pos": n})).is_err());
+
+    // Ablated heads write nothing, and the recompute still matches the re-run trace.
+    ok(&mut s, "ablate", json!({"heads": [[3, 1], [3, 4]]}));
+    let r = ok(&mut s, "flow_layer", json!({"layer": 3, "pos": n - 1}));
+    assert_eq!(r["heads"][1]["ablated"], json!(true));
+    assert_eq!(f(&r["heads"][4]["write_norm"]), 0.0);
+    let check = r["check"].as_array().unwrap();
+    assert!(f(&check[0]) < 1e-3 && f(&check[1]) < 1e-3, "{check:?}");
+}
+
+/// The chat penalties must not break answers that have to repeat digits:
+/// DRY used to read "100 + 20" echoed from the question as a loop and push the
+/// next "0" down ("100 + 201 = 301"). Defaults otherwise, greedy for determinism.
+#[test]
+fn chat_penalties_leave_arithmetic_alone() {
+    let mut s = session();
+    let st = ok(&mut s, "chat_state", json!(null));
+    assert_eq!(st["sampler"]["repeat_penalty"].as_f64().unwrap() as f32, 1.1);
+    assert!(st["sampler"]["end_bias"].as_f64().unwrap() > 0.0);
+    for (q, want) in [("What is 100 + 200?", "300"), ("compute 100 + 200", "300")] {
+        ok(&mut s, "chat_reset", json!({}));
+        ok(&mut s, "chat_send", json!({"text": q}));
+        let mut text = String::new();
+        loop {
+            let r = ok(&mut s, "chat_step", json!({"n": 16, "temperature": 0.0}));
+            text += &r["tokens"].as_array().unwrap().iter().map(|t| t["text"].as_str().unwrap()).collect::<String>();
+            if r["done"].as_bool().unwrap() || text.len() > 600 {
+                break;
+            }
+        }
+        assert!(text.contains(want), "{q} → {text:?}");
+    }
+    assert!(s.call("chat_step", &json!({"end_bias": -1})).is_err());
+}
+
+/// The end bias makes replies wrap up: an open-ended prompt ends on its own.
+#[test]
+fn chat_end_bias_ends_rambling_replies() {
+    let mut s = session();
+    ok(&mut s, "chat_send", json!({"text": "What is love?"}));
+    let mut n = 0;
+    loop {
+        let r = ok(&mut s, "chat_step", json!({"n": 32}));
+        n += r["tokens"].as_array().unwrap().len();
+        if r["done"].as_bool().unwrap() {
+            assert!(r["stop"].as_str().unwrap().starts_with("end of turn"), "{}", r["stop"]);
+            break;
+        }
+        assert!(n < 400, "no end of turn after {n} tokens");
+    }
+}

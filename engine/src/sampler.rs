@@ -47,6 +47,11 @@ pub struct Sampler {
     /// Tokens that end a DRY match, sorted (newlines, quotes, colons and the
     /// chat control tokens): structure is supposed to repeat; prose isn't.
     pub dry_breakers: Vec<u32>,
+    /// Tokens DRY never penalizes, indexed by id (empty = none). For digits,
+    /// operators and punctuation: "What is 100 + 200?" → "100 + 200 = 300"
+    /// legitimately repeats "100 + 20", and penalizing the next "0" turns the
+    /// answer into "100 + 201 = 301". Loops are made of words.
+    pub dry_exempt: Vec<bool>,
     rng: u64,
 }
 
@@ -66,6 +71,7 @@ impl Sampler {
             dry_base: 1.75,
             dry_allowed_len: 2,
             dry_breakers: vec![],
+            dry_exempt: vec![],
             rng: seed,
         }
     }
@@ -95,6 +101,21 @@ impl Sampler {
     /// The default DRY sequence breakers, as bytes a token may contain.
     pub fn dry_breaker_bytes(bytes: &[u8]) -> bool {
         bytes.iter().any(|b| matches!(b, b'\n' | b':' | b'"' | b'*'))
+    }
+
+    /// Penalize words only: neither penalty touches a token with no letter in
+    /// it (digits, operators, punctuation, whitespace), nor the control tokens.
+    /// Each digit is its own token in SmolLM2's vocabulary, so "100 + 200 = 300"
+    /// must repeat the question's digits, and DRY would read the echoed
+    /// "100 + 20" as a loop and push the next "0" down ("100 + 201 = 301").
+    /// Loops are made of words. `decode` gives a token's bytes.
+    pub fn words_only(mut self, vocab: usize, specials: &[u32], decode: impl Fn(u32) -> Vec<u8>) -> Self {
+        let letterless: Vec<bool> = (0..vocab as u32)
+            .map(|id| !specials.contains(&id) && decode(id).iter().all(|b| b.is_ascii() && !b.is_ascii_alphabetic()))
+            .collect();
+        self.no_penalty = specials.iter().copied().chain((0..vocab as u32).filter(|&id| letterless[id as usize])).collect();
+        self.dry_exempt = letterless;
+        self
     }
 
     /// The penalties [`Self::sample_with_history`] would apply, as
@@ -169,7 +190,7 @@ impl Sampler {
             while len < DRY_MAX_MATCH && len <= e && h[e - len] == h[n - 1 - len] && !brk(h[e - len]) {
                 len += 1;
             }
-            if len >= self.dry_allowed_len {
+            if len >= self.dry_allowed_len && self.dry_exempt.get(h[e + 1] as usize) != Some(&true) {
                 let best = longest.entry(h[e + 1]).or_insert(0);
                 *best = (*best).max(len);
             }

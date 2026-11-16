@@ -28,11 +28,12 @@
     <button data-mode="chat" title="A chat app, with a lighter look inside">Chat</button>
   </nav>
   <div id="model-info"></div>
+  <button id="info-btn" type="button" title="Features and structure of SmolLM2-135M-Instruct"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 7.2v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="4.9" r="1"/></svg>About the model</button>
 </header>
 
 <div id="complete-view">
   <section id="controls">
-    <textarea id="prompt" rows="2" spellcheck="false" placeholder="Type a prompt… (Ctrl/⌘+Enter to run)"></textarea>
+    <textarea id="prompt" rows="2" spellcheck="false" placeholder="Type a prompt… (Ctrl/⌘+Enter to run)">The capital of France is Paris. The capital of Germany is</textarea>
     <div class="row">
       <button id="run" class="primary"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z"/></svg>Run prompt</button>
       <button id="step" title="Sample one token and feed it through the model (one decode step)">Step <span class="kbd">+1</span></button>
@@ -42,8 +43,8 @@
         <div class="knob" title="Divide the logits by this before softmax. 0 = always the top token"><span>temperature</span><input id="temp" type="range" min="0" max="2" step="0.05" value="0.7"><output data-zero="greedy"></output></div>
         <div class="knob" title="Keep the smallest set of tokens whose probabilities add up to p"><span>top-p</span><input id="topp" type="range" min="0" max="1" step="0.01" value="0.9"><output data-max="off"></output></div>
         <div class="knob" title="Keep only the k most likely tokens. 0 = no limit"><span>top-k</span><input id="topk" type="range" min="0" max="100" step="1" value="0"><output data-zero="off"></output></div>
-        <div class="knob" title="DRY: push down a token that would continue a sequence that already appeared, harder the longer the repeat. Stops loops without punishing single repeated words"><span>anti-loop (DRY)</span><input id="dry" type="range" min="0" max="2" step="0.05" value="0.8"><output data-zero="off"></output></div>
-        <div class="knob" title="Logits of tokens seen in the last 64 positions are pushed down by this factor"><span>repeat penalty</span><input id="rep" type="range" min="1" max="2" step="0.01" value="1"><output data-min="off"></output></div>
+        <div class="knob" title="DRY: push down a word that would continue a sequence that already appeared, harder the longer the repeat. Stops loops without punishing single repeated words; numbers and punctuation are exempt"><span>anti-loop (DRY)</span><input id="dry" type="range" min="0" max="2" step="0.05" value="0.8"><output data-zero="off"></output></div>
+        <div class="knob" title="Logits of words seen in the last 64 positions are pushed down by this factor (numbers and punctuation are exempt)"><span>repeat penalty</span><input id="rep" type="range" min="1" max="2" step="0.01" value="1"><output data-min="off"></output></div>
       </div>
     </div>
   </section>
@@ -71,19 +72,38 @@
   </div>
 </div>
 
-<div id="loading">
+<div id="loading" role="dialog" aria-modal="true" aria-labelledby="load-title">
   <div class="loadbox">
     <div class="loadlogo" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
-    <h2>Loading the model into your browser</h2>
-    <p class="dim">Everything runs locally in this tab: a Rust inference engine compiled to WebAssembly.
-      The weights come straight from Hugging Face the first time and are cached for later visits.</p>
-    <div id="load-stage">starting…</div>
-    <div class="loadbar"><i id="load-bar"></i></div>
-    <div id="load-detail" class="dim mono"></div>
+    <div id="consent" hidden>
+      <h2 id="load-title">Download the model?</h2>
+      <p>To run anything, this page needs <b>SmolLM2-135M-Instruct</b>: <b id="consent-size">269 MB</b> of weights,
+        fetched once from <span id="consent-src">Hugging Face</span>.</p>
+      <ul class="facts">
+        <li id="consent-cache">It's kept in your browser's cache, so later visits start in about a second.</li>
+        <li>Everything then runs in this tab. Nothing you type is sent anywhere.</li>
+        <li>On a metered connection, maybe wait for Wi-Fi.</li>
+      </ul>
+      <div class="loadactions">
+        <button id="consent-no" type="button">Not now</button>
+        <button id="consent-yes" type="button" class="primary"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>Download 269 MB</button>
+      </div>
+    </div>
+    <div id="progress" hidden>
+      <h2>Loading the model into your browser</h2>
+      <p class="dim">A Rust inference engine compiled to WebAssembly, running in this tab.</p>
+      <div id="load-stage">starting…</div>
+      <div class="loadbar"><i id="load-bar"></i></div>
+      <div id="load-detail" class="dim mono"></div>
+      <div class="loadactions" id="load-fail" hidden><button id="load-close" type="button">Close</button><button id="load-retry" type="button" class="primary">Try again</button></div>
+    </div>
   </div>
 </div>
+<dialog id="info" aria-labelledby="info-title"></dialog>
 <div id="tip" role="tooltip"></div>
 <div id="flash"></div>
+<script src="glossary.js"></script>
+<script src="flow.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

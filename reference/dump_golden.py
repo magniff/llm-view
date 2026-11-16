@@ -187,7 +187,10 @@ def main():
     inst_tok = AutoTokenizer.from_pretrained(inst_dir)
     inst = AutoModelForCausalLM.from_pretrained(inst_dir, dtype=torch.float32)
     chat = []
-    for q in ["What is the capital of France?", "Write a haiku about rust."]:
+    # Arithmetic and open-ended prompts too: sampler settings get tuned on
+    # these, so the plain greedy model underneath must be exactly HF's.
+    for q in ["What is the capital of France?", "Write a haiku about rust.", "What is 100 + 200?",
+              "compute 100 + 200", "What is 45 - 17?", "What is 1000 - 1?", "What is 9 times 8?", "What is love?"]:
         msgs = [{"role": "user", "content": q}]
         text = inst_tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
         chat_ids = inst_tok(text, add_special_tokens=False)["input_ids"]

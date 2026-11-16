@@ -14,12 +14,14 @@
 //! - [`generate`]    — the prefill + decode loop
 //! - [`chat`]        — ChatML formatting and multi-turn conversations
 //! - [`trace`]       — a hook that records a whole session by position, plus the logit lens
+//! - [`flow`]      — one position through one layer in full detail, and where its information came from
 //! - [`session`]     — the visualizer's API: one session, driven by method + JSON args
 //! - [`download`]    — fetch model files from the Hugging Face Hub on first run
 
 pub mod chat;
 pub mod clock;
 pub mod download;
+pub mod flow;
 pub mod generate;
 pub mod hooks;
 pub mod kv_cache;
