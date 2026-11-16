@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Inside SmolLM2</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css" integrity="sha384-nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+" crossorigin="anonymous" referrerpolicy="no-referrer">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -40,7 +41,7 @@
       <button id="gen" title="16 decode steps">Generate <span class="kbd">+16</span></button>
       <span class="grow"></span>
       <div class="knobs">
-        <div class="knob" title="Divide the logits by this before softmax. 0 = always the top token"><span>temperature</span><input id="temp" type="range" min="0" max="2" step="0.05" value="0.7"><output data-zero="greedy"></output></div>
+        <div class="knob" title="Divide the logits by this before softmax. 0 = always the top token"><span>temperature</span><input id="temp" type="range" min="0" max="2" step="0.05" value="0"><output data-zero="greedy"></output></div>
         <div class="knob" title="Keep the smallest set of tokens whose probabilities add up to p"><span>top-p</span><input id="topp" type="range" min="0" max="1" step="0.01" value="0.9"><output data-max="off"></output></div>
         <div class="knob" title="Keep only the k most likely tokens. 0 = no limit"><span>top-k</span><input id="topk" type="range" min="0" max="100" step="1" value="0"><output data-zero="off"></output></div>
         <div class="knob" title="DRY: push down a word that would continue a sequence that already appeared, harder the longer the repeat. Stops loops without punishing single repeated words; numbers and punctuation are exempt"><span>anti-loop (DRY)</span><input id="dry" type="range" min="0" max="2" step="0.05" value="0.8"><output data-zero="off"></output></div>
@@ -63,6 +64,7 @@
       <form id="composer">
         <textarea id="chat-input" rows="2" placeholder="Message SmolLM2… (Enter to send, Shift+Enter for a new line)"></textarea>
         <div class="composer-buttons">
+          <button id="reset" class="icon" type="button" title="New chat: clear the conversation and the KV cache" aria-label="New chat"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.2 8a4.8 4.8 0 1 0 1.5-3.5M3 2.6v2.6h2.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           <button id="send" class="primary icon" type="submit" title="Send (Enter)" aria-label="Send"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           <button id="stop" class="icon" type="button" title="Stop generating" aria-label="Stop" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg></button>
         </div>
@@ -104,6 +106,10 @@
 <div id="flash"></div>
 <script src="glossary.js"></script>
 <script src="flow.js"></script>
+<!-- maths typesetting for the Step-by-step formulas; the page works without it (formulas fall back to TeX source) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js" integrity="sha384-7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="walk-info.js"></script>
+<script src="walk.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

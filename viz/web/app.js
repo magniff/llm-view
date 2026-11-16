@@ -209,6 +209,58 @@ function samp() {
   };
 }
 
+// ------------------------------------------------------------------ sampler presets
+//
+// One click sets every sampler knob. They run from "the model alone" to "the
+// sampler steps in a lot", so the effect of each intervention can be seen in
+// the chat tint (orange = the sampler overruled the model). Knobs a tab doesn't
+// have are skipped: completion has no wrap-up, chat has no top-k.
+const PRESETS = [
+  { id: 'greedy', name: 'Greedy', s: { temp: 0, topp: 1, topk: 0, dry: 0, rep: 1, end: 0 },
+    about: 'Always the model\'s favourite token, nothing changed: the model alone. Right where it knows, but most long replies loop forever.' },
+  { id: 'focused', name: 'Focused', s: { temp: 0, topp: 0.9, topk: 0, dry: 0.8, rep: 1, end: 0.05 },
+    about: 'The model\'s favourite, unless anti-loop (DRY) sees a phrase repeating; in chat, wrap-up also nudges long replies to end. Overrules the model on ~3% of tokens. Same question, same answer.' },
+  { id: 'card', name: 'Model card', s: { temp: 0.2, topp: 0.9, topk: 0, dry: 0, rep: 1, end: 0 },
+    about: 'What Hugging Face recommends for SmolLM2: temperature 0.2, top-p 0.9, no penalties. A little variety (~5% overruled), but it still loops.' },
+  { id: 'balanced', name: 'Balanced', s: { temp: 0.2, topp: 0.9, topk: 0, dry: 0.8, rep: 1.1, end: 0.05 },
+    about: 'Model card plus anti-loop, wrap-up and a repeat penalty on words. Varied and never loops, but overrules the model on ~22% of tokens: common words like "is" get pushed down.' },
+  { id: 'creative', name: 'Creative', s: { temp: 0.8, topp: 0.95, topk: 0, dry: 0.8, rep: 1.1, end: 0.05 },
+    about: 'Hotter and wider: more varied wording, more wrong facts. Overrules the model on ~39% of tokens.' },
+  { id: 'odds', name: 'Model\'s own odds', s: { temp: 1, topp: 1, topk: 0, dry: 0, rep: 1, end: 0 },
+    about: 'Draws straight from the model\'s distribution: every token gets exactly the chance the model gave it. Unfiltered, so ~48% of picks are not its favourite, and it wanders.' },
+];
+
+// A preset <select> for the knobs with ids `${prefix}temp`, `${prefix}topp`, ...
+// It shows "Custom" once a slider is moved off every preset.
+function presetPicker(prefix, def) {
+  const sel = el('select', { id: prefix + 'preset', 'aria-label': 'sampler preset' },
+    PRESETS.map((p) => el('option', { value: p.id, text: p.name })),
+    el('option', { value: 'custom', text: 'Custom', disabled: '' }));
+  const about = el('div', { class: 'preset-about dim small' });
+  const knobs = () => Object.keys(PRESETS[0].s).map((k) => [k, document.getElementById(prefix + k)]).filter(([, r]) => r);
+  const match = () => {
+    const p = PRESETS.find((p) => knobs().every(([k, r]) => +r.value === p.s[k]));
+    sel.value = p ? p.id : 'custom';
+    about.textContent = p ? p.about : 'Your own mix. Pick a preset to start over.';
+  };
+  const apply = (id) => {
+    const p = PRESETS.find((p) => p.id === id);
+    for (const [k, r] of knobs()) {
+      r.value = p.s[k];
+      syncRange(r);
+      r.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    match();
+  };
+  sel.onchange = () => apply(sel.value);
+  // Call once the knobs are in the page.
+  const wire = () => {
+    for (const [, r] of knobs()) r.addEventListener('input', match);
+    apply(def);
+  };
+  return { sel, about, wire };
+}
+
 // selMode: 'last' = select the newest token, 'keep' = keep selection if valid.
 function setState(st, selMode = 'keep') {
   S.st = st;
@@ -297,14 +349,23 @@ function renderStatus() {
 const TABS = [
   ['next', 'Next token', viewNext],
   ['flow', 'Flow', viewFlow],
+  ['walk', 'Step by step', viewWalk],
   ['lens', 'Logit lens', viewLens],
   ['attn', 'Attention', viewAttn],
   ['kv', 'KV cache', viewKV],
   ['resid', 'Residual stream', viewResid],
 ];
 
+// Only these tabs are shown for now. The others stay in the code, hidden: add
+// an id here to bring one back. Links to a hidden tab (About dialog, glossary)
+// go to Step by step, which covers the same ground one operation at a time.
+const SHOWN_TABS = ['next', 'walk'];
+const shownTab = (id) => (SHOWN_TABS.includes(id) ? id : 'walk');
+const tabName = (id) => TABS.find((t) => t[0] === id)[1];
+
 const TAB_ICONS = {
   flow: 'M3 14V2M3 10c4 0 6-6 10-6M3 10c4 0 6 2 10 2',
+  walk: 'M2 13.5h3v-3h3v-3h3v-3h3',
   lens: 'M2 3h12M2 6.5h12M2 10h12M2 13.5h7',
   attn: 'M3 13 8 3l5 10M5 9h6',
   resid: 'M2 12c2-6 4-6 6-3s4 3 6-4',
@@ -317,7 +378,7 @@ const TAB_ICONS = {
 function renderTabs() {
   const bar = $('#tabs');
   if (!bar.childElementCount) {
-    bar.append(...TABS.map(([id, name]) => el('button', {
+    bar.append(...TABS.filter(([id]) => SHOWN_TABS.includes(id)).map(([id, name]) => el('button', {
       'data-tab': id,
       onclick: () => {
         if (S.tab === id) return;
@@ -1081,6 +1142,7 @@ const M = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e8 ? 1 : 2) + 'M' : n >= 1e
 
 // Close the dialog and show one of the completion tabs.
 function gotoTab(id) {
+  id = shownTab(id);
   $('#info').close();
   if (MODE !== 'complete') setMode('complete');
   const b = document.querySelector(`#tabs button[data-tab="${id}"]`);
@@ -1089,7 +1151,10 @@ function gotoTab(id) {
 
 function buildInfo() {
   const c = CFG, kvBytes = c.layers * 2 * c.kv_heads * c.head_dim * 4;
-  const see = (tab, name) => el('button', { class: 'see', type: 'button', onclick: () => gotoTab(tab), title: `close this and open the ${name} tab` }, name + ' →');
+  const see = (tab, name) => {
+    name = tabName(shownTab(tab));
+    return el('button', { class: 'see', type: 'button', onclick: () => gotoTab(tab), title: `close this and open the ${name} tab` }, name + ' →');
+  };
   const stat = (v, label, hint) => el('div', { class: 'stat', title: hint || '' }, el('b', { text: v }), el('span', { text: label }));
   const shape = (s) => el('code', { class: 'shape', text: s });
   const box = (cls, name, what, sh, link) => el('div', { class: 'blk ' + cls }, el('div', {}, el('b', { text: name }), el('span', { class: 'dim', text: what })), el('div', { class: 'blkr' }, sh ? shape(sh) : null, link));
@@ -1194,7 +1259,7 @@ function buildGlossary() {
   const items = GLOSSARY.map((g) => {
     const node = el('div', { class: 'gitem', id: 'g-' + g.t.toLowerCase().replace(/[^a-z0-9]+/g, '-') },
       el('div', { class: 'gterm' }, el('b', { text: g.t }), g.tab ? el('button', { class: 'see', type: 'button', onclick: () => gotoTab(g.tab), title: 'close this and open that tab' },
-        'see it: ' + TABS.find((t) => t[0] === g.tab)[1] + ' →') : null),
+        'see it: ' + tabName(shownTab(g.tab)) + ' →') : null),
       el('p', { text: g.d }),
       el('div', { class: 'glinks' }, g.l.map(([label, href]) => el('a', { href, target: '_blank', rel: 'noopener' }, label, ' ↗'))));
     return { g, node, hay: [g.t, g.aka || '', g.d].join(' ').toLowerCase() };
@@ -1292,20 +1357,51 @@ function chatSamp() {
   };
 }
 
-function tintOf(p) {
+// Two different things can make a reply token interesting, and they are marked
+// apart: the model itself was unsure (its favourite had under half the
+// probability: blue tint), or the sampler picked something other than the
+// model's favourite (orange underline). Every token carries p (the model's own
+// probability) and q (the chance the sampler gave it after the repetition
+// penalty, DRY, the wrap-up bias, temperature and top-p).
+function tintOf(top) {
   // Confident tokens stay plain; the less sure the model was, the stronger the tint.
-  const a = Math.max(0, Math.min(0.6, (1 - p) * 0.75));
+  const a = Math.max(0, Math.min(0.6, (1 - top) * 0.75));
   return a < 0.04 ? '' : `rgba(127,163,207,${a.toFixed(2)})`;
 }
 
+const tokenTop = (t) => t.alts[0][1];
+const overridden = (t) => t.text !== t.alts[0][0];
+
+function markToken(span, t) {
+  span.style.background = C.tint ? tintOf(tokenTop(t)) : '';
+  span.style.boxShadow = C.tint && overridden(t) ? 'inset 0 -2px 0 var(--accent)' : '';
+}
+
 function tokenTip(e, t) {
+  const [favText, favP] = t.alts[0];
+  const odds = (q) => (q > 0 ? pct(q) : '—');
+  // The sampler's favourite: the listed token it gave the most chance.
+  const samplerFav = t.alts.reduce((a, b) => (b[2] > a[2] ? b : a));
+  let why;
+  if (!overridden(t)) {
+    why = favP < 0.5
+      ? `the model was unsure here: its favourite had only ${pct(favP)}`
+      : 'the model\'s favourite, picked';
+  } else if (samplerFav[0] === t.text) {
+    why = `not the model's favourite (${JSON.stringify(favText)} at ${pct(favP)}): the repetition penalty, DRY or the wrap-up bias pushed it down, so the sampler preferred this one`;
+  } else {
+    why = `not the model's favourite (${JSON.stringify(favText)} at ${pct(favP)}): a random draw at this temperature, which gave it ${odds(t.q)}`;
+  }
+  const head = (text) => el('span', { class: 'dim', text });
   showTip(e,
-    el('b', { text: `chose ${JSON.stringify(t.text)} · ${pct(t.p)}` }),
-    el('div', { class: 'bars', style: 'margin:6px 0' }, t.alts.map(([text, p]) => [
-      el('span', { class: 'mono', style: text === t.text ? 'color:var(--accent)' : '', text: clip(vis(text), 16) }),
-      el('div', { class: 'bar', style: `width:${Math.max(1, p * 160)}px` }),
-      el('span', { text: pct(p) })])),
-    el('div', { class: 'dim', text: t.p < 0.5 ? 'the model was unsure here: other tokens were nearly as likely' : 'the model\'s top 5 candidates at this point' }));
+    el('b', { text: `chose ${JSON.stringify(t.text)}` }),
+    el('div', { class: 'bars', style: 'margin:6px 0;grid-template-columns:max-content max-content max-content' },
+      head(''), head('model'), head('sampler'),
+      t.alts.map(([text, p, q]) => [
+        el('span', { class: 'mono', style: text === t.text ? 'color:var(--accent)' : '', text: clip(vis(text), 16) }),
+        el('span', {}, el('div', { class: 'bar', style: `display:inline-block;width:${Math.max(1, p * 90)}px;margin-right:6px` }), pct(p)),
+        el('span', {}, el('div', { class: 'bar alt', style: `display:inline-block;width:${Math.max(1, q * 90)}px;margin-right:6px` }), odds(q))])),
+    el('div', { class: 'dim', style: 'max-width:340px', text: why }));
 }
 
 // Append reply tokens to an assistant bubble. Bytes go through a streaming UTF-8
@@ -1314,8 +1410,8 @@ function appendTokens(bubble, tokens) {
   for (const t of tokens) {
     const piece = bubble.decoder.decode(new Uint8Array(t.bytes), { stream: true });
     const span = el('span', { class: 'ct', text: piece });
-    span.dataset.p = t.p;
-    if (C.tint) span.style.background = tintOf(t.p);
+    span.tok = t;
+    markToken(span, t);
     span.onmousemove = (e) => tokenTip(e, t);
     span.onmouseleave = hideTip;
     bubble.body.append(span);
@@ -1390,11 +1486,21 @@ function renderChatSide() {
   const turn = $('#c-turn');
   if (!t) { turn.replaceChildren(el('span', { class: 'dim', text: 'nothing yet' })); return; }
   const rate = t.generated / Math.max(1e-6, t.decode_ms / 1000);
-  turn.replaceChildren(
+  turn.replaceChildren(...[
     el('div', {}, B(String(t.prefilled)), ' new tokens prefilled in one pass', el('span', { class: 'dim', text: ` (${t.prefill_ms.toFixed(0)} ms)` })),
     el('div', {}, B(String(t.reused)), ' earlier tokens reused from the KV cache'),
     el('div', {}, B(String(t.generated)), ' tokens generated', t.generated ? el('span', { class: 'dim', text: ` · ${rate.toFixed(0)} tok/s` }) : null),
-    t.stop ? el('div', { class: 'dim', text: t.stop }) : null);
+    overrideLine(),
+    t.stop ? el('div', { class: 'dim', text: t.stop }) : null].filter(Boolean));
+}
+
+// How often the sampler overruled the model in the latest reply.
+function overrideLine() {
+  const last = chatLog.findLast((m) => m.role === 'assistant');
+  if (!last || !last.tokens.length) return null;
+  const n = last.tokens.filter(overridden).length;
+  return el('div', { title: 'picks that were not the model\'s own favourite (underlined orange in the reply)' },
+    B(String(n)), ` of ${last.tokens.length} picks overruled the model`, el('span', { class: 'dim', text: ` (${pct(n / last.tokens.length)})` }));
 }
 
 async function refreshChat() {
@@ -1411,6 +1517,7 @@ function setChatBusy(on) {
   document.body.classList.toggle('working', on);
   $('#send').hidden = on;
   $('#stop').hidden = !on;
+  $('#reset').disabled = on;
 }
 
 async function sendChat() {
@@ -1483,13 +1590,14 @@ async function inspectChat() {
 }
 
 function setupChat() {
+  const chatPreset = presetPicker('c-', 'focused');
   const raw = el('input', { type: 'checkbox', id: 'c-raw' });
   raw.onchange = () => { C.raw = raw.checked; if (C.raw) refreshChat(); else renderMessages(); };
   const tint = el('input', { type: 'checkbox' });
   tint.checked = true;
   tint.onchange = () => {
     C.tint = tint.checked;
-    document.querySelectorAll('.msg .ct').forEach((s) => (s.style.background = C.tint ? tintOf(+s.dataset.p) : ''));
+    document.querySelectorAll('.msg .ct').forEach((s) => s.tok && markToken(s, s.tok));
   };
   $('#chat-side').append(
     el('h3', { text: 'context window' }),
@@ -1501,25 +1609,29 @@ function setupChat() {
       'Only the new tokens of each turn go through the model in one pass (', B('prefill'), '); everything before is already in the ',
       B('KV cache'), '. The reply then comes one token at a time (', B('decode'), '), each step reading the whole cache.'),
     el('h3', { text: 'view' }),
-    el('label', { class: 'block' }, tint, 'tint tokens the model was unsure about'),
+    el('label', { class: 'block' }, tint, 'mark unsure tokens (blue) and off-favourite picks (orange)'),
     el('label', { class: 'block' }, raw, 'show the raw token stream'),
     el('button', { class: 'wide', text: 'Inspect this conversation →', title: 'open the transcript in completion mode with every view', onclick: () => inspectChat() }),
     el('h3', { text: 'sampling' }),
+    el('div', { class: 'knob preset' }, el('span', { text: 'preset' }), chatPreset.sel),
+    chatPreset.about,
     el('div', { class: 'knobs stack' },
-      knob('c-temp', 'temperature', 0, 2, 0.05, 0.2, 'Divide the logits by this before softmax. 0 = always the top token', { zero: 'greedy' }),
+      knob('c-temp', 'temperature', 0, 2, 0.05, 0, 'Divide the logits by this before softmax. 0 = always the top token', { zero: 'greedy' }),
       knob('c-topp', 'top-p', 0, 1, 0.01, 0.9, 'Keep the smallest set of tokens whose probabilities add up to p', { max: 'off' }),
       knob('c-dry', 'anti-loop (DRY)', 0, 2, 0.05, 0.8, 'Push down a word that would continue a sequence that already appeared, harder the longer the repeat. Numbers and punctuation are exempt', { zero: 'off' }),
-      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1.1, 'Push down words used in the last 64 positions. Numbers and punctuation are exempt, so arithmetic still works', { min: 'off' }),
+      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1, 'Push down words used in the last 64 positions. Numbers and punctuation are exempt, so arithmetic still works', { min: 'off' }),
       knob('c-end', 'wrap-up', 0, 0.2, 0.01, 0.05, 'After 40 tokens, raise the chance of ending the reply by this much (in logits) per extra token: keeps answers from rambling', { zero: 'off' })),
     el('h3', { text: 'system prompt' }),
     el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false', text: 'You are a helpful AI assistant named SmolLM, trained by Hugging Face' }),
     el('button', { class: 'wide', text: 'New chat', title: 'clear the conversation (applies the system prompt)', onclick: () => newChat() }));
 
+  chatPreset.wire();
   $('#composer').onsubmit = (e) => { e.preventDefault(); sendChat(); };
   $('#chat-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
   });
   $('#stop').onclick = () => (C.stopRequested = true);
+  $('#reset').onclick = () => newChat();
   document.querySelectorAll('#modes button').forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
   renderMessages();
 }
@@ -1538,8 +1650,15 @@ async function withModel(fn) {
 }
 $('#prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('#run').click(); } });
 for (const id of ['#temp', '#topp', '#topk', '#rep', '#dry']) $(id).addEventListener('input', () => { if (S.tab === 'next') renderTab(); });
+{
+  const p = presetPicker('', 'focused');
+  $('#controls .knobs').prepend(el('div', { class: 'knob preset' }, el('span', { text: 'sampler preset' }), p.sel));
+  $('#controls').append(p.about);
+  p.wire();
+}
 document.addEventListener('keydown', (e) => {
-  if (MODE !== 'complete' || !S.st || e.target.matches('textarea, input')) return;
+  // defaultPrevented: a tab (Flow, Step by step) already used the arrow key.
+  if (MODE !== 'complete' || !S.st || e.defaultPrevented || e.target.matches('textarea, input, select')) return;
   if (e.key === 'ArrowLeft' && S.sel > 0) S.sel--;
   else if (e.key === 'ArrowRight' && S.sel < S.st.tokens.length - 1) S.sel++;
   else return;
@@ -1550,7 +1669,7 @@ document.addEventListener('keydown', (e) => {
 
 (async () => {
   const fromHash = location.hash.slice(1);
-  if (TABS.some((t) => t[0] === fromHash)) S.tab = fromHash;
+  if (TABS.some((t) => t[0] === fromHash)) S.tab = shownTab(fromHash);
   renderTabs();
   setupChat();
   document.querySelectorAll('input[type=range]').forEach(syncRange);

@@ -32,12 +32,14 @@ It is built for learning: the engine is small enough to read in an afternoon, an
 
 ## The visualizer
 
-**Completion mode** runs raw text through the model and lets you poke at every layer:
+**Completion mode** runs raw text through the model and lets you poke at every layer. For now the page shows only
+**Next token** and **Step by step**; the other tabs are hidden (`SHOWN_TABS` in `viz/web/app.js` brings them back):
 
 | Tab | What you see |
 |---|---|
 | **Next token** | The model's distribution (blue) and what the sampler turns it into (orange). Drag temperature, top-p, top-k and the penalties and watch the bars move. Click a token to force it. |
 | **Flow** | One position's trip through the whole network. A map shows, layer by layer, which earlier tokens each attention write came from and how each layer moves the final answer; open any stage to see every vector it computes (q, k, v, RoPE, scores, each head, the MLP's gate/up/neurons, the residual adds) with the real numbers, and read any write as the tokens it pushes up. |
+| **Step by step** | The forward pass one operation at a time, on the whole prompt as `[tokens, …]` matrices: tokenize, one-hot × embedding table, RMSNorm (measure, divide, × gain), q/k/v projections, split into heads, RoPE, scores, causal mask, softmax, weighted sum of values, output projection, residual add, then the MLP, and finally the norm, logits and softmax. Each step names the checkpoint tensors it uses (`model.layers.0.self_attn.q_proj.weight [576, 576]`), gives the formula with shapes, and shows the real numbers. Next / Back, or ← / →. An **Explain** button opens a prose explanation of each step, with links to papers, Wikipedia and videos. |
 | **Logit lens** | Project the residual stream onto the vocabulary after every layer: watch the answer form from the bottom up, see where it "locks in", and follow its probability layer by layer. |
 | **Attention** | Every head of every layer as a heatmap, grouped by the KV head they share (GQA). Ablate heads and re-run to see what breaks. |
 | **KV cache** | What's actually stored per layer and position, and why decoding one token is cheap. |
@@ -87,19 +89,25 @@ rambling (1.2) wrecks arithmetic, because every digit is its own token here and 
 the digits of the question. And DRY, the anti-loop sampler, read the echoed "100 + 20" as a loop and pushed the
 next "0" down: "100 + 201 = 301".
 
-So the chat defaults are: the model card's temperature 0.2 and top-p 0.9; **DRY 0.8 and a repetition penalty of 1.1
-that only apply to tokens containing a letter** (numbers, operators and punctuation are exempt: loops are made of
-words); and a **wrap-up bias** that, once a reply passes 40 tokens, raises the logit of `<|im_end|>` by 0.05 per
-extra token. `cargo run --release --example chat_tuning` produced this (10 arithmetic questions, 5 factual ones and
-6 open prompts like "What is love?", 10 seeds each, open replies capped at 300 tokens):
+So the penalties apply **only to tokens containing a letter** (numbers, operators and punctuation are exempt: loops
+are made of words), and a **wrap-up bias** raises the logit of `<|im_end|>` by 0.05 per token once a reply passes
+40 tokens. The page offers these as presets, ordered by how often the sampler overrules the model's own favourite
+token. `cargo run --release --example chat_tuning` produced this (10 arithmetic questions, 5 factual ones and 6 open
+prompts like "What is love?", 10 seeds each, open replies capped at 300 tokens):
 
-| Setting | Arithmetic | Facts | Open replies: median length | ended on their own | looped |
-|---|---|---|---|---|---|
-| Greedy, no penalties (the model itself) | 70% | 100% | 300 | 33% | 50 / 60 |
-| Previous default (T 0.2, DRY 0.8 on everything) | 43% | 100% | 293 | 51% | 2 / 60 |
-| Repetition penalty 1.2 (on everything) | 13% | 60% | 224 | 77% | 0 / 36 |
-| **Default: DRY + rep 1.1 on words, wrap-up 0.05** | **65%** | **100%** | **188** | **100%** | **0 / 60** |
-| Same at temperature 0 | 70% | 100% | 219 | 100% | 0 / 60 |
+| Preset | Arithmetic | Facts | Open replies: median length | ended on their own | looped | overruled |
+|---|---|---|---|---|---|---|
+| Greedy (the model alone) | 70% | 100% | 300 | 33% | 50 / 60 | 0% |
+| **Focused (default): greedy + DRY 0.8 + wrap-up** | **70%** | **100%** | **173** | **100%** | **0 / 60** | **3%** |
+| Model card: T 0.2, top-p 0.9 | 59% | 100% | 300 | 36% | 37 / 60 | 5% |
+| Balanced: model card + DRY + rep 1.1 + wrap-up | 65% | 100% | 188 | 100% | 0 / 60 | 22% |
+| Creative: T 0.8, top-p 0.95, DRY + rep 1.1 + wrap-up | 60% | 78% | 172 | 100% | 0 / 60 | 39% |
+| Model's own odds: T 1 | 46% | 80% | 250 | 61% | 1 / 60 | 48% |
+
+Focused does as well as greedy on questions with one right answer and still never loops, because it only steps in
+when a phrase starts repeating. Its one cost: the same question always gets the same answer. A repetition penalty,
+even 1.1, overrules the model far more often (on common words like "is"), and 1.2 on every token drops arithmetic
+to 13%. In chat, hovering a reply token shows both the model's odds and the sampler's.
 
 The arithmetic ceiling is the model's, not the engine's: the golden tests check that greedy chat replies, including
 "What is 45 - 17?" (to which HF's own `transformers` answers 32), match `transformers` token for token. Every knob is
@@ -150,7 +158,7 @@ engine/          the inference engine (library + `smol` CLI)
 wasm/            the engine compiled for the browser (raw ABI, no wasm-bindgen)
 viz/
   src/main.rs      dev server (axum): static files, /models, optional native API
-  web/             the static site: app.js (views), flow.js (the Flow tab), worker.js (engine in a Web Worker)
+  web/             the static site: app.js (views), flow.js (the Flow tab), walk.js and walk-info.js (Step by step and its explanations), worker.js (engine in a Web Worker)
 reference/       Python scripts that produce the golden data from `transformers`
 scripts/         build-web.sh, test-wasm.mjs
 ```

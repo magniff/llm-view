@@ -159,8 +159,27 @@ fn chat_reply_tokens_carry_probabilities_and_bytes() {
         // Greedy picks the top alternative, so its probability is the top one's.
         assert!((p - alts[0][1].as_f64().unwrap()).abs() < 1e-6);
         assert!(alts.windows(2).all(|w| w[0][1].as_f64() >= w[1][1].as_f64()));
+        // Greedy: the sampler gives the pick all of its chance.
+        assert_eq!(t["q"].as_f64(), Some(1.0));
+        assert_eq!(alts[0][2].as_f64(), Some(1.0));
         let bytes: Vec<u8> = t["bytes"].as_array().unwrap().iter().map(|b| b.as_u64().unwrap() as u8).collect();
         assert_eq!(String::from_utf8_lossy(&bytes), t["text"].as_str().unwrap());
+    }
+}
+
+/// With penalties and temperature on, `q` is the sampler's own chance for each
+/// token: the pick always had some, and the listed odds never exceed 1 in total.
+#[test]
+fn chat_reply_tokens_carry_the_samplers_odds() {
+    let mut s = session();
+    ok(&mut s, "chat_send", json!({"text": "List three colors, then list them again."}));
+    let r = ok(&mut s, "chat_step", json!({"n": 24, "temperature": 0.7, "top_p": 0.9, "repeat_penalty": 1.3, "dry": 0.8}));
+    for t in r["tokens"].as_array().unwrap() {
+        assert!(t["q"].as_f64().unwrap() > 0.0);
+        let alts = t["alts"].as_array().unwrap();
+        assert!((5..=6).contains(&alts.len()));
+        let total: f64 = alts.iter().map(|a| a[2].as_f64().unwrap()).sum();
+        assert!(total <= 1.0 + 1e-3);
     }
 }
 
@@ -298,6 +317,35 @@ fn bad_requests_are_errors_not_panics() {
     ok(&mut s, "rewind", json!({"len": 100000}));
 }
 
+/// The step-by-step view's matrices chain together: each layer starts where the
+/// previous one ended, the first starts at the embeddings, RoPE leaves position
+/// 0 alone, and every attention row is a distribution.
+#[test]
+fn walk_matrices_chain_together() {
+    let mut s = session();
+    let ends = ok(&mut s, "walk_ends", json!(null));
+    let n = ends["n"].as_u64().unwrap() as usize;
+    assert!(n > 2 && n <= 16);
+    let l0 = ok(&mut s, "walk_layer", json!({"layer": 0}));
+    let l1 = ok(&mut s, "walk_layer", json!({"layer": 1}));
+    assert_eq!(l0["x_in"], ends["embed"]);
+    assert_eq!(l0["x_out"], l1["x_in"]);
+    assert_eq!(l0["q"][0], l0["q_pre"][0]);
+    assert_ne!(l0["q"][1], l0["q_pre"][1]);
+    assert_eq!(l0["q"].as_array().unwrap().len(), n);
+    assert_eq!(l0["k"][0].as_array().unwrap().len(), 192);
+    assert_eq!(l0["gate"][0].as_array().unwrap().len(), 1536);
+    for (p, heads) in l0["probs"].as_array().unwrap().iter().enumerate() {
+        for h in heads.as_array().unwrap() {
+            let h = h.as_array().unwrap();
+            assert_eq!(h.len(), p + 1, "position {p} sees positions 0..={p}");
+            assert!((h.iter().map(|x| x.as_f64().unwrap()).sum::<f64>() - 1.0).abs() < 1e-3);
+        }
+    }
+    assert_eq!(ends["out"][0]["top"].as_array().unwrap().len(), 5);
+    assert!(s.call("walk_layer", &json!({"layer": 30})).is_err());
+}
+
 /// The Flow view recomputes one position through one layer from the trace and
 /// the KV cache; it must land exactly where the real forward pass did, and its
 /// decompositions must add up.
@@ -369,14 +417,16 @@ fn flow_recomputes_the_forward_pass() {
 fn chat_penalties_leave_arithmetic_alone() {
     let mut s = session();
     let st = ok(&mut s, "chat_state", json!(null));
-    assert_eq!(st["sampler"]["repeat_penalty"].as_f64().unwrap() as f32, 1.1);
+    assert_eq!(st["sampler"]["temperature"].as_f64(), Some(0.0));
+    assert!(st["sampler"]["dry"].as_f64().unwrap() > 0.0);
     assert!(st["sampler"]["end_bias"].as_f64().unwrap() > 0.0);
     for (q, want) in [("What is 100 + 200?", "300"), ("compute 100 + 200", "300")] {
         ok(&mut s, "chat_reset", json!({}));
         ok(&mut s, "chat_send", json!({"text": q}));
         let mut text = String::new();
         loop {
-            let r = ok(&mut s, "chat_step", json!({"n": 16, "temperature": 0.0}));
+            // With the Balanced preset's repetition penalty too: it must spare digits.
+            let r = ok(&mut s, "chat_step", json!({"n": 16, "temperature": 0.0, "repeat_penalty": 1.1}));
             text += &r["tokens"].as_array().unwrap().iter().map(|t| t["text"].as_str().unwrap()).collect::<String>();
             if r["done"].as_bool().unwrap() || text.len() > 600 {
                 break;

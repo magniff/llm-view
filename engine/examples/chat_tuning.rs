@@ -6,7 +6,7 @@
 //!     cargo run --release --example chat_tuning
 //!     (sample replies go to stderr; the table to stdout)
 
-use engine::{chat::render_single, chat::DEFAULT_SYSTEM, hooks::NoHooks, model::Model, sampler::Sampler, tokenizer::Tokenizer};
+use engine::{chat::render_single, chat::DEFAULT_SYSTEM, hooks::NoHooks, model::Model, sampler::{argmax, Sampler}, tokenizer::Tokenizer};
 use std::collections::HashMap;
 
 /// How many 8-token windows exactly repeat an earlier, non-overlapping one.
@@ -23,6 +23,7 @@ fn loop_score(ids: &[u32]) -> usize {
 struct Setting {
     name: &'static str,
     temp: f32,
+    top_p: f32,
     rep: f32,
     /// Repetition penalty only for tokens containing a letter (digits, operators, punctuation exempt).
     words_only: bool,
@@ -36,10 +37,10 @@ struct Setting {
     dry_words: bool,
 }
 
-const S: Setting = Setting { name: "", temp: 0.2, rep: 1.0, words_only: false, brief: false, end_after: 0, end_slope: 0.0, dry: 0.8, reply_only: false, dry_words: false };
+const S: Setting = Setting { name: "", temp: 0.2, top_p: 0.9, rep: 1.0, words_only: false, brief: false, end_after: 0, end_slope: 0.0, dry: 0.8, reply_only: false, dry_words: false };
 
-/// One reply: (tokens, ended by <|im_end|>).
-fn reply(m: &Model, tok: &Tokenizer, s: &Setting, sampler: &mut Sampler, q: &str, max: usize) -> (Vec<u32>, bool) {
+/// One reply: (tokens, ended by <|im_end|>, picks that were not the model's favourite).
+fn reply(m: &Model, tok: &Tokenizer, s: &Setting, sampler: &mut Sampler, q: &str, max: usize) -> (Vec<u32>, bool, usize) {
     let sys = s.brief.then(|| format!("{DEFAULT_SYSTEM}. Answer briefly."));
     let prompt = tok.encode(&render_single(sys.as_deref(), q));
     let mut cache = m.new_cache(prompt.len() + max + 1);
@@ -47,20 +48,23 @@ fn reply(m: &Model, tok: &Tokenizer, s: &Setting, sampler: &mut Sampler, q: &str
     let mut logits = m.forward(&prompt, &mut cache, &mut NoHooks).row(prompt.len() - 1).to_vec();
     let eos = m.cfg.eos_token;
     let mut out = vec![];
+    let mut overrides = 0;
     while out.len() < max {
+        let favourite = argmax(&logits);
         // The longer the reply, the more likely ending it becomes.
         if s.end_slope > 0.0 && out.len() > s.end_after {
             logits[eos as usize] += s.end_slope * (out.len() - s.end_after) as f32;
         }
         let next = sampler.sample_with_history(&logits, if s.reply_only { &out } else { &hist });
+        overrides += (next != favourite) as usize;
         if next == eos || next == 0 {
-            return (out, true);
+            return (out, true, overrides);
         }
         out.push(next);
         hist.push(next);
         logits = m.forward(&[next], &mut cache, &mut NoHooks).row(0).to_vec();
     }
-    (out, false)
+    (out, false, overrides)
 }
 
 fn main() {
@@ -86,21 +90,23 @@ fn main() {
     ];
     let open = ["What is love?", "What is the meaning of life?", "What is happiness?", "Tell me about yourself.",
                 "How was your day?", "Write a poem about the sea."];
+    // The presets offered in the page.
+    let guard = Setting { dry_words: true, words_only: true, end_after: 40, end_slope: 0.05, ..S };
     let settings = [
-        Setting { name: "default: T.2 DRY.8", ..S },
-        Setting { name: "greedy, no penalties", temp: 0.0, dry: 0.0, ..S },
-        Setting { name: "DRYw + w1.1 + e40 T.2", dry_words: true, rep: 1.1, words_only: true, end_after: 40, end_slope: 0.05, ..S },
-        Setting { name: "DRYw + w1.1 + e40 T.1", temp: 0.1, dry_words: true, rep: 1.1, words_only: true, end_after: 40, end_slope: 0.05, ..S },
-        Setting { name: "DRYw + w1.1 + e40 T0", temp: 0.0, dry_words: true, rep: 1.1, words_only: true, end_after: 40, end_slope: 0.05, ..S },
-        Setting { name: "DRYw + w1.15 + e40 T.2", dry_words: true, rep: 1.15, words_only: true, end_after: 40, end_slope: 0.05, ..S },
-        Setting { name: "DRYw + w1.1 + e40 T.3", temp: 0.3, dry_words: true, rep: 1.1, words_only: true, end_after: 40, end_slope: 0.05, ..S },
+        Setting { name: "greedy", temp: 0.0, dry: 0.0, ..S },
+        Setting { name: "model's odds (T1)", temp: 1.0, top_p: 1.0, dry: 0.0, ..S },
+        Setting { name: "model card (T.2 p.9)", dry: 0.0, ..S },
+        Setting { name: "greedy + loop guard", temp: 0.0, ..guard },
+        Setting { name: "loop guard (T.2)", ..guard },
+        Setting { name: "balanced (+rep 1.1)", rep: 1.1, ..guard },
+        Setting { name: "creative (T.8 p.95)", temp: 0.8, top_p: 0.95, rep: 1.1, ..guard },
     ];
     let (m, tok, specials, no_letters) = (&m, &tok, &specials, &no_letters);
     let seeds = 10;
     let rows: Vec<String> = std::thread::scope(|sc| {
         let hs: Vec<_> = settings.iter().map(|s| sc.spawn(move || {
             let mk = |seed| {
-                let mut x = Sampler::new(s.temp, 0, 0.9, seed)
+                let mut x = Sampler::new(s.temp, 0, s.top_p, seed)
                     .with_dry(m.cfg.vocab, |id| specials.contains(&id) || Sampler::dry_breaker_bytes(&tok.decode_bytes(&[id])));
                 x.dry_multiplier = s.dry;
                 x.repeat_penalty = s.rep;
@@ -116,7 +122,7 @@ fn main() {
                 let (mut ok, mut n) = (0, 0);
                 for &(q, ans) in qs {
                     for seed in 0..seeds {
-                        let (ids, _) = reply(m, tok, s, &mut mk(seed), q, 120);
+                        let (ids, _, _) = reply(m, tok, s, &mut mk(seed), q, 120);
                         let text = tok.decode(&ids);
                         n += 1;
                         if text.to_lowercase().contains(&ans.to_lowercase()) { ok += 1; }
@@ -126,11 +132,13 @@ fn main() {
                 100 * ok / n
             };
             let (a, f) = (score(&arith), score(&facts));
-            let (mut lens, mut ended, mut looped, mut rep, mut n) = (vec![], 0, 0, 0, 0);
+            let (mut lens, mut ended, mut looped, mut rep, mut n, mut over, mut toks) = (vec![], 0, 0, 0, 0, 0, 0);
             for q in open {
                 for seed in 0..seeds {
-                    let (ids, end) = reply(m, tok, s, &mut mk(seed), q, 300);
+                    let (ids, end, o) = reply(m, tok, s, &mut mk(seed), q, 300);
                     n += 1;
+                    over += o;
+                    toks += ids.len() + end as usize;
                     ended += end as usize;
                     let ls = loop_score(&ids);
                     looped += (ls > 10) as usize;
@@ -140,8 +148,8 @@ fn main() {
                 }
             }
             lens.sort();
-            format!("{:<24} arithmetic {:>3}%  facts {:>3}% | open: median {:>3} tok, p90 {:>3}, ended {:>3}%, loops {:>2}/{n}, any repeats {:>2}/{n}",
-                s.name, a, f, lens[n / 2], lens[n * 9 / 10], 100 * ended / n, looped, rep)
+            format!("{:<22} arithmetic {:>3}%  facts {:>3}% | open: median {:>3} tok, p90 {:>3}, ended {:>3}%, loops {:>2}/{n}, any repeats {:>2}/{n}, overridden {:>2}%",
+                s.name, a, f, lens[n / 2], lens[n * 9 / 10], 100 * ended / n, looped, rep, 100 * over / toks.max(1))
         })).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });

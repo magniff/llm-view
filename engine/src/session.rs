@@ -87,6 +87,9 @@ fn tok_text(tok: &Tokenizer, id: u32) -> String {
 }
 
 /// Round for JSON: 4 significant decimals is plenty for a picture and keeps payloads small.
+/// Positions the step-by-step view shows: whole matrices, so keep it readable.
+const WALK_MAX: usize = 16;
+
 fn r4(x: f32) -> f64 {
     (x as f64 * 1e4).round() / 1e4
 }
@@ -465,6 +468,60 @@ impl Session {
         }))
     }
 
+    /// The step-by-step view: one layer for every position at once, as the
+    /// matrices `[T, …]` the forward pass works with (rows = tokens). Only the
+    /// first [`WALK_MAX`] positions: it is for reading, not for long prompts.
+    fn walk_layer(&self, layer: usize) -> Result<Value, String> {
+        let c = &self.model.cfg;
+        if layer >= c.n_layers {
+            return Err("no such layer".into());
+        }
+        let n = self.trace.len().min(WALK_MAX);
+        let fl: Vec<_> = (0..n)
+            .map(|p| layer_flow(&self.model, &self.cache, &self.trace.resid[2 * layer][p], layer, p, &self.trace.ablate))
+            .collect();
+        let rows = |f: &dyn Fn(&crate::flow::LayerFlow) -> &[f32]| fl.iter().map(|x| r4v(f(x))).collect::<Vec<_>>();
+        let l = &self.model.layers[layer];
+        Ok(json!({
+            "layer": layer, "n": n, "eps": c.norm_eps,
+            "attn_norm_w": r4v(&l.attn_norm), "mlp_norm_w": r4v(&l.mlp_norm),
+            "x_in": rows(&|f| &f.x_in), "attn_rms": fl.iter().map(|f| r4(f.attn_rms)).collect::<Vec<_>>(), "xn": rows(&|f| &f.xn),
+            "q_pre": rows(&|f| &f.q_pre), "q": rows(&|f| &f.q), "k_pre": rows(&|f| &f.k_pre), "k": rows(&|f| &f.k), "v": rows(&|f| &f.v),
+            // [position][head][source 0..=position]
+            "probs": fl.iter().map(|f| f.probs.iter().map(|p| r4v(p)).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "head_out": rows(&|f| &f.head_out), "d_attn": rows(&|f| &f.d_attn), "x_mid": rows(&|f| &f.x_mid),
+            "mlp_rms": fl.iter().map(|f| r4(f.mlp_rms)).collect::<Vec<_>>(), "xn2": rows(&|f| &f.xn2),
+            "gate": rows(&|f| &f.gate), "up": rows(&|f| &f.up), "act": rows(&|f| &f.act), "hidden": rows(&|f| &f.hidden),
+            "d_mlp": rows(&|f| &f.d_mlp), "x_out": rows(&|f| &f.x_out),
+        }))
+    }
+
+    /// The two ends of the step-by-step view: the embedding rows, and the final
+    /// norm, logits and probabilities for every position.
+    fn walk_ends(&self) -> Result<Value, String> {
+        let c = &self.model.cfg;
+        let n = self.trace.len().min(WALK_MAX);
+        let out: Vec<Value> = (0..n)
+            .map(|p| {
+                let x = &self.trace.resid[2 * c.n_layers][p];
+                let fr = self.final_rms(p);
+                let xn: Vec<f32> = x.iter().zip(&self.model.final_norm).map(|(v, g)| v * g / fr).collect();
+                let logits = direct_logits(&self.model, &[x], fr);
+                let tl = top_logits(logits.row(0), 5);
+                json!({
+                    "x": r4v(x), "rms": r4(fr), "xn": r4v(&xn), "lse": r4(tl.lse),
+                    "top": tl.top.iter().map(|&(id, l)| json!([id, self.text(id), r4(l), r4((l - tl.lse).exp())])).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "n": n,
+            "embed": (0..n).map(|p| r4v(&self.trace.resid[0][p])).collect::<Vec<_>>(),
+            "norm_w": r4v(&self.model.final_norm),
+            "out": out,
+        }))
+    }
+
     /// The first step: a token id picks one row of the embedding table.
     fn flow_embed(&mut self, pos: usize) -> Result<Value, String> {
         self.check_pos(pos)?;
@@ -535,11 +592,11 @@ impl Session {
         let sp: Vec<u32> = specials.iter().copied().collect();
         let words = |s: Sampler| s.words_only(model.cfg.vocab, &sp, |id| tok.decode_bytes(&[id]));
         let sampler = words(Sampler::new(0.7, 0, 0.9, 1234).with_dry(model.cfg.vocab, breaker));
-        // Chat: the model card's T 0.2 / top-p 0.9, plus what `examples/chat_tuning.rs`
-        // found keeps answers right while stopping rambles: DRY and a mild
-        // repetition penalty on words only, and a bias towards ending the turn.
-        let mut chat_sampler = words(Sampler::new(0.2, 0, 0.9, 42).with_dry(model.cfg.vocab, breaker));
-        chat_sampler.repeat_penalty = 1.1;
+        // Chat ("Focused" in the page): what `examples/chat_tuning.rs` found keeps
+        // answers right while stopping rambles. The model's own top token, unless
+        // DRY (on words only) sees a loop starting; plus a bias towards ending the
+        // turn. The sampler overrules the model on only ~3% of tokens.
+        let chat_sampler = words(Sampler::new(0.0, 0, 0.9, 42).with_dry(model.cfg.vocab, breaker));
         let chat = ChatState {
             cache: model.new_cache(chat_ctx),
             tokens: vec![],
@@ -642,16 +699,22 @@ impl Session {
                 stop = json!("context window full");
                 break;
             }
-            let next = if c.end_bias > 0.0 && c.reply_len > END_AFTER {
-                let mut l = c.last_logits.clone();
+            // What the sampler draws from: the wrap-up bias, then the
+            // repetition penalty and DRY, then temperature and top-p.
+            let mut l = c.last_logits.clone();
+            if c.end_bias > 0.0 && c.reply_len > END_AFTER {
                 l[eos as usize] += c.end_bias * (c.reply_len - END_AFTER) as f32;
-                c.sampler.sample_with_history(&l, &c.tokens)
-            } else {
-                c.sampler.sample_with_history(&c.last_logits, &c.tokens)
-            };
-            // Probabilities shown are the model's own, before any sampler adjustment.
+            }
+            let l = c.sampler.adjust(&l, &c.tokens);
+            let dist = c.sampler.distribution(&l);
+            let next = c.sampler.sample(&l);
+            // `p` is the model's own probability, before any sampler adjustment;
+            // `q` is the chance the sampler actually gave the token.
             let top = top_logits(&c.last_logits, 5);
             let p = |l: f32| r4((l - top.lse).exp());
+            let q = |id: u32| r4(dist.iter().find(|d| d.0 == id).map_or(0.0, |d| d.1));
+            // The sampler's own favourite, when it differs from the model's.
+            let (fav, _) = dist[0];
             let info = json!({
                 "id": next,
                 "text": tok_text(&self.tok, next),
@@ -659,7 +722,13 @@ impl Session {
                 // decodes the reply as a byte stream rather than token by token.
                 "bytes": self.tok.decode_bytes(&[next]),
                 "p": p(c.last_logits[next as usize]),
-                "alts": top.top.iter().map(|&(id, l)| json!([tok_text(&self.tok, id), p(l)])).collect::<Vec<_>>(),
+                "q": q(next),
+                // [text, model p, sampler q] for the model's top 5, plus the
+                // sampler's favourite if the penalties pushed it in from outside.
+                "alts": top.top.iter().map(|&(id, _)| id)
+                    .chain((!top.top.iter().any(|t| t.0 == fav)).then_some(fav))
+                    .map(|id| json!([tok_text(&self.tok, id), p(c.last_logits[id as usize]), q(id)]))
+                    .collect::<Vec<_>>(),
             });
             if next == eos || next == 0 {
                 // End of turn. Not fed: chat_send closes the turn before the next message.
@@ -762,6 +831,8 @@ impl Session {
             "flow_layer" => self.flow_layer(need("layer")?, need("pos")?),
             "flow_embed" => self.flow_embed(need("pos")?),
             "flow_out" => self.flow_out(need("pos")?),
+            "walk_layer" => self.walk_layer(need("layer")?),
+            "walk_ends" => self.walk_ends(),
             "tokenize" => {
                 let text = args["text"].as_str().ok_or("tokenize: missing 'text'")?;
                 Ok(self.tokenize_view(text, args["chat"].as_bool().unwrap_or(false)))

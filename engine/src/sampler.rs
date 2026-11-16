@@ -136,6 +136,12 @@ impl Sampler {
         }
     }
 
+    /// `logits` after the history-based penalties: what [`Self::sample`] sees
+    /// inside [`Self::sample_with_history`].
+    pub fn adjust(&self, logits: &[f32], history: &[u32]) -> Vec<f32> {
+        self.penalized(logits, history).unwrap_or_else(|| logits.to_vec())
+    }
+
     /// Logits after the history-based penalties, or None if none apply.
     fn penalized(&self, logits: &[f32], history: &[u32]) -> Option<Vec<f32>> {
         // A penalty must be a positive factor; 0 or NaN would turn logits into
@@ -213,18 +219,42 @@ impl Sampler {
         }
     }
 
+    /// The distribution [`Self::sample`] draws from, after temperature, top-k
+    /// and top-p, most likely first. Greedy settings give the argmax with
+    /// probability 1.
+    pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+        self.nucleus(logits).unwrap_or_else(|| vec![(argmax(logits), 1.0)])
+    }
+
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
+        let Some(dist) = self.nucleus(logits) else {
+            return argmax(logits);
+        };
+        let r = self.next_f32();
+        let mut acc = 0.0;
+        for &(id, p) in &dist {
+            acc += p;
+            if r < acc {
+                return id;
+            }
+        }
+        dist[dist.len() - 1].0
+    }
+
+    /// `(token, probability)` after temperature, top-k and top-p, most likely
+    /// first, or None when sampling is greedy.
+    fn nucleus(&self, logits: &[f32]) -> Option<Vec<(u32, f32)>> {
         // `!(t > 0)` rather than `t <= 0` so that NaN is greedy too.
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(self.temperature > 0.0) {
-            return argmax(logits);
+            return None;
         }
         let mut cand: Vec<(u32, f32)> =
             logits.iter().enumerate().map(|(i, &l)| (i as u32, l / self.temperature)).collect();
         // A tiny temperature overflows l/T to ±inf, and softmax of inf is NaN.
         // In that limit sampling *is* argmax, so take it.
         if cand.iter().any(|c| !c.1.is_finite()) {
-            return argmax(logits);
+            return None;
         }
         let by_desc = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1);
         if self.top_k > 0 && self.top_k < cand.len() {
@@ -246,16 +276,7 @@ impl Sampler {
             let s: f32 = p.iter().sum();
             p.iter_mut().for_each(|x| *x /= s);
         }
-
-        let r = self.next_f32();
-        let mut acc = 0.0;
-        for (i, &pi) in p.iter().enumerate() {
-            acc += pi;
-            if r < acc {
-                return cand[i].0;
-            }
-        }
-        cand[p.len() - 1].0
+        Some(cand.iter().zip(p).map(|(c, p)| (c.0, p)).collect())
     }
 }
 
