@@ -11,14 +11,13 @@
 // Messages out: {id, ok, result | error}  and  {progress: {...}} while loading.
 
 const MODELS = {
-  'smollm2-135m-instruct': { repo: 'HuggingFaceTB/SmolLM2-135M-Instruct', sha256: '5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c', bytes: 269060552 },
+  'smollm2-135m': { repo: 'HuggingFaceTB/SmolLM2-135M', sha256: '80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1', bytes: 269060552 },
 };
 const CACHE = 'smollm2-files-v1';
 // Inspector positions. Its trace grows with N positions as ~0.33 MB·N (residual
 // snapshots + MLP activations) plus 540 B·N² (every head's attention row), so
 // about 170 + 140 MB at 512. Raise it with care: wasm32 tops out at 4 GB.
 const MAX_SEQ = 512;
-const CHAT_CTX = 2048; // chat positions; the KV cache needs 46 KB per position (135M)
 
 let ex = null; // wasm exports
 let crashed = '';
@@ -137,7 +136,7 @@ async function load(name, source) {
       log_str: (p, n) => { lastPanic = dec.decode(new Uint8Array(ex.memory.buffer, p, n)); console.error(lastPanic); },
     },
   };
-  const { instance } = await WebAssembly.instantiateStreaming(fetch('engine.wasm'), imports);
+  const { instance } = await WebAssembly.instantiateStreaming(fetch('engine.wasm', { cache: 'no-cache' }), imports); // revalidate: a stale engine breaks the protocol
   ex = instance.exports;
   ex.install_panic_hook();
 
@@ -156,7 +155,7 @@ async function load(name, source) {
   }
   w = null; // let the 269 MB download be garbage-collected
   progress({ stage: 'warming up', got: 0, total: 0 });
-  invoke(() => ex.finish(MAX_SEQ, CHAT_CTX));
+  invoke(() => ex.finish(MAX_SEQ));
   return { name, max_seq: MAX_SEQ };
 }
 

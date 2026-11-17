@@ -39,13 +39,13 @@ const GLOSSARY = [
     l: [['Hugging Face: tokenizer summary', 'https://huggingface.co/docs/transformers/main/en/tokenizer_summary']],
   },
   {
-    t: 'Special tokens', aka: 'im_start im_end endoftext bos eos control tokens', g: 'Text and tokens',
-    d: 'Tokens that never come from ordinary text and mark structure instead. SmolLM2 has 17 (ids 0–16). The ones used here: <|endoftext|> (0), <|im_start|> (1) which opens a chat turn, and <|im_end|> (2) which closes one. The model ends its reply by producing <|im_end|> itself; apart from a length limit, that is the only way a reply stops.',
-    l: [['Hugging Face: chat templates', 'https://huggingface.co/docs/transformers/main/en/chat_templating']],
+    t: 'Special tokens', aka: 'endoftext bos eos control tokens', g: 'Text and tokens',
+    d: 'Tokens that never come from ordinary text and mark structure instead. SmolLM2 has 17 (ids 0–16), mostly for code (<file_sep>, <jupyter_code>…). The important one here is <|endoftext|> (0): in training it separates documents, so when the model produces it, it considers the text finished and generation stops.',
+    l: [['Hugging Face: tokenizer summary', 'https://huggingface.co/docs/transformers/main/en/tokenizer_summary']],
   },
   {
-    t: 'Chat template (ChatML)', aka: 'chatml prompt format system prompt', g: 'Text and tokens',
-    d: 'Chat is still text completion. A conversation is written out as one text in the format the model was fine-tuned on: "<|im_start|>system … <|im_end|> <|im_start|>user … <|im_end|> <|im_start|>assistant", and the model continues from there. The system prompt is the first block, an instruction the model was trained to follow. Chat mode\'s "show the raw token stream" shows exactly this.',
+    t: 'Base model vs chat model', aka: 'base instruct chat template chatml completion', g: 'Text and tokens',
+    d: 'This page runs SmolLM2-135M, a base model: it only continues text, so the prompt is the start of a text, not a question. A chat model (SmolLM2-135M-Instruct) is the same network trained further on conversations written in a template like "<|im_start|>user … <|im_end|> <|im_start|>assistant"; chatting with it is still text completion, of that template.',
     l: [['Hugging Face: chat templates', 'https://huggingface.co/docs/transformers/main/en/chat_templating']],
   },
   {
@@ -73,7 +73,7 @@ const GLOSSARY = [
   {
     t: 'Embedding', aka: 'embed embedding table word vector', g: 'Inside the model',
     d: 'The first step: each token id selects one row of a 49,152 × 576 table, giving a vector of 576 numbers. Training places tokens with similar uses close together: the nearest rows to "That" are " That", "that", " THAT" and "Those". The vector is the model\'s starting point, before any context has been mixed in.',
-    l: [W('Word_embedding')], tab: 'flow',
+    l: [W('Word_embedding')], tab: 'walk',
   },
   {
     t: 'Hidden size (d_model)', aka: 'width model dimension 576', g: 'Inside the model',
@@ -82,92 +82,92 @@ const GLOSSARY = [
   },
   {
     t: 'Residual stream', aka: 'residual connection skip connection hidden state', g: 'Inside the model',
-    d: 'The running vector per position that flows up through the model. Layers never replace it; each one reads it and adds its output back (x = x + layer(x)). So the final vector is the embedding plus the sum of everything every layer wrote, and you can measure each layer\'s contribution. The Residual stream tab shows these sizes.',
-    l: [W('Residual_neural_network'), ['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html']], tab: 'resid',
+    d: 'The running vector per position that flows up through the model. Layers never replace it; each one reads it and adds its output back (x = x + layer(x)). So the final vector is the embedding plus the sum of everything every layer wrote, and you can measure each layer\'s contribution.',
+    l: [W('Residual_neural_network'), ['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html']], tab: 'walk',
   },
   {
     t: 'Layer (block)', aka: 'transformer block decoder layer', g: 'Inside the model',
     d: 'One repeat of the basic unit: norm → attention → add, then norm → MLP → add. SmolLM2 stacks 30 of them, each with its own weights (3.54M parameters per layer). Early layers tend to handle local, surface patterns, later ones more abstract ones, but nothing forces a neat division.',
-    l: [W('Transformer_(deep_learning_architecture)')], tab: 'flow',
+    l: [W('Transformer_(deep_learning_architecture)')], tab: 'walk',
   },
   {
     t: 'RMSNorm', aka: 'normalization layer norm layernorm pre-norm', g: 'Inside the model',
     d: 'Rescales a vector so its root-mean-square is 1, then multiplies each coordinate by a learned weight. It keeps the input of every sublayer at a predictable scale however big the residual stream grows. "Pre-norm" means it\'s applied to the input of each sublayer, not to the stream itself, which makes deep models much easier to train.',
-    l: [ARXIV('1910.07467', 'Zhang & Sennrich 2019, RMSNorm'), ARXIV('2002.04745', 'Xiong et al. 2020, pre-norm vs post-norm'), W('Normalization_(machine_learning)')], tab: 'flow',
+    l: [ARXIV('1910.07467', 'Zhang & Sennrich 2019, RMSNorm'), ARXIV('2002.04745', 'Xiong et al. 2020, pre-norm vs post-norm'), W('Normalization_(machine_learning)')], tab: 'walk',
   },
   {
     t: 'MLP (feed-forward network)', aka: 'ffn feedforward mlp', g: 'Inside the model',
     d: 'The second half of each layer, applied to every position separately: project the 576-vector up to 1,536 numbers, apply a nonlinearity, project back down. It holds 59% of SmolLM2\'s parameters and is thought to store much of what the model "knows", like lookup tables from patterns to facts.',
-    l: [W('Multilayer_perceptron')], tab: 'flow',
+    l: [W('Multilayer_perceptron')], tab: 'walk',
   },
   {
     t: 'SwiGLU', aka: 'glu gated linear unit gate up down', g: 'Inside the model',
     d: 'The MLP variant used here: down( silu(gate·x) ⊙ up·x ). Two separate projections up to 1,536; one goes through SiLU and multiplies the other element by element, so one half decides how much of the other passes. It needs three matrices instead of two but trains better for the same compute.',
-    l: [ARXIV('2002.05202', 'Shazeer 2020, GLU Variants Improve Transformer'), ARXIV('1612.08083', 'Dauphin et al. 2016, gated linear units')], tab: 'flow',
+    l: [ARXIV('2002.05202', 'Shazeer 2020, GLU Variants Improve Transformer'), ARXIV('1612.08083', 'Dauphin et al. 2016, gated linear units')], tab: 'walk',
   },
   {
     t: 'SiLU (swish)', aka: 'activation function nonlinearity relu', g: 'Inside the model',
     d: 'The nonlinearity in the MLP: silu(x) = x · sigmoid(x). Roughly x for large positive inputs and roughly 0 for large negative ones, with a smooth dip in between. Without some nonlinearity the whole network would collapse into a single matrix multiplication.',
-    l: [W('Swish_function'), W('Activation_function')], tab: 'flow',
+    l: [W('Swish_function'), W('Activation_function')], tab: 'walk',
   },
   {
     t: 'Neuron', aka: 'mlp neuron unit', g: 'Inside the model',
     d: 'One of the 1,536 intermediate numbers in an MLP, and the column of weights that writes it back to the residual stream. Some neurons are tied to clear features, but most respond to mixtures. Two neurons in layer 11 are the ones that create the huge first-token activation.',
-    l: [['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html']], tab: 'flow',
+    l: [['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html']], tab: 'walk',
   },
   {
     t: 'Tied embeddings', aka: 'weight tying lm head unembedding output head', g: 'Inside the model',
     d: 'The output layer reuses the embedding table: the score of a token is the dot product of the final vector with that token\'s embedding row. This saves 28.3M parameters (21% of this model) and means "predicting token X" and "reading token X" share one vector.',
-    l: [ARXIV('1608.05859', 'Press & Wolf 2016, Using the Output Embedding')], tab: 'flow',
+    l: [ARXIV('1608.05859', 'Press & Wolf 2016, Using the Output Embedding')], tab: 'walk',
   },
 
   // ------------------------------------------------------------ attention
   {
     t: 'Attention', aka: 'self-attention scaled dot-product', g: 'Attention',
     d: 'The only step where positions exchange information. Each position makes a query; every earlier position offers a key and a value. Query·key scores, after softmax, become weights that add up to 1, and the output is the weighted sum of values. "Look back at whatever is relevant and copy some of it here."',
-    l: [W('Attention_(machine_learning)'), ['3Blue1Brown: attention', 'https://www.3blue1brown.com/lessons/attention'], ARXIV('1706.03762', 'Vaswani et al. 2017')], tab: 'attn',
+    l: [W('Attention_(machine_learning)'), ['3Blue1Brown: attention', 'https://www.3blue1brown.com/lessons/attention'], ARXIV('1706.03762', 'Vaswani et al. 2017')], tab: 'walk',
   },
   {
     t: 'Query, key, value (q, k, v)', aka: 'qkv projections', g: 'Attention',
     d: 'Three different projections of the same (normalized) residual vector. Query: what this position is looking for. Key: what this position offers, to be matched against queries. Value: what it hands over when attended to. Each is 64 numbers per head. Scores are q·k / √64, so the scale doesn\'t grow with the size.',
-    l: [W('Attention_(machine_learning)'), ['The Illustrated Transformer', 'https://jalammar.github.io/illustrated-transformer/']], tab: 'flow',
+    l: [W('Attention_(machine_learning)'), ['The Illustrated Transformer', 'https://jalammar.github.io/illustrated-transformer/']], tab: 'walk',
   },
   {
     t: 'Attention head', aka: 'multi-head attention heads', g: 'Attention',
     d: 'Attention is run several times in parallel with separate weights; each copy is a head and can learn its own pattern (previous token, same word earlier, start of sentence…). SmolLM2 has 9 heads of 64 dimensions per layer, 270 in total. Their outputs are concatenated and projected back to 576.',
-    l: [W('Transformer_(deep_learning_architecture)')], tab: 'attn',
+    l: [W('Transformer_(deep_learning_architecture)')], tab: 'walk',
   },
   {
     t: 'Grouped-query attention (GQA)', aka: 'gqa multi-query mqa kv heads', g: 'Attention',
     d: 'Heads share keys and values: SmolLM2\'s 9 query heads are split into 3 groups, each using one key/value head. The KV cache is 3× smaller and decoding is faster, at little cost in quality. The extreme, one shared key/value head, is multi-query attention.',
-    l: [ARXIV('2305.13245', 'Ainslie et al. 2023, GQA'), ARXIV('1911.02150', 'Shazeer 2019, multi-query attention')], tab: 'attn',
+    l: [ARXIV('2305.13245', 'Ainslie et al. 2023, GQA'), ARXIV('1911.02150', 'Shazeer 2019, multi-query attention')], tab: 'walk',
   },
   {
     t: 'Causal mask', aka: 'masking autoregressive mask', g: 'Attention',
     d: 'Position i may only attend to positions 0…i, never to later ones: future scores are set to −∞ before the softmax. That is what lets the model be trained on every position of a text at once, and why the attention heatmaps are triangles.',
-    l: [W('Transformer_(deep_learning_architecture)')], tab: 'attn',
+    l: [W('Transformer_(deep_learning_architecture)')], tab: 'walk',
   },
   {
     t: 'RoPE (rotary position embedding)', aka: 'rotary positional encoding position', g: 'Attention',
     d: 'Attention by itself doesn\'t know word order. RoPE encodes it by rotating pairs of numbers in q and k by an angle proportional to the position, at 32 different speeds (base θ = 100,000). The rotation cancels out in q·k except for the difference in positions, so heads see relative distance. At position 0 the angle is 0: nothing happens.',
-    l: [ARXIV('2104.09864', 'Su et al. 2021, RoFormer'), ['EleutherAI: rotary embeddings explained', 'https://blog.eleuther.ai/rotary-embeddings/']], tab: 'flow',
+    l: [ARXIV('2104.09864', 'Su et al. 2021, RoFormer'), ['EleutherAI: rotary embeddings explained', 'https://blog.eleuther.ai/rotary-embeddings/']], tab: 'walk',
   },
   {
     t: 'Attention sink', aka: 'sink first token bos', g: 'Attention',
     d: 'Softmax weights must add up to 1, so a head with nothing useful to read still has to put its attention somewhere. Models learn to dump it on the first token, which then works as a no-op. That is why so many heatmaps have a bright first column, and why a lone first token makes poor predictions: its vector is busy being the sink.',
-    l: [ARXIV('2309.17453', 'Xiao et al. 2023, attention sinks')], tab: 'attn',
+    l: [ARXIV('2309.17453', 'Xiao et al. 2023, attention sinks')], tab: 'walk',
   },
   {
     t: 'Massive activations', aka: 'outlier dimensions spike', g: 'Attention',
     d: 'A handful of residual-stream coordinates that become huge (thousands of times the rest) at the first token. In SmolLM2 two neurons in layer 11 write about 22,500 into dimension 507, and layers 28–29 remove it again. It works like a fixed bias that makes the attention sink possible.',
-    l: [ARXIV('2402.17762', 'Sun et al. 2024, Massive Activations in LLMs')], tab: 'resid',
+    l: [ARXIV('2402.17762', 'Sun et al. 2024, Massive Activations in LLMs')], tab: 'walk',
   },
 
   // ------------------------------------------------------------ running the model
   {
     t: 'Forward pass', aka: 'inference', g: 'Running the model',
     d: 'One run of the network from token ids to next-token scores: embed, 30 layers, final norm, output head. It is pure arithmetic with fixed weights, deterministic, and the same in this browser as on a GPU. Generating text is a loop of forward passes plus a sampling step.',
-    l: [['Hugging Face: generation with LLMs', 'https://huggingface.co/docs/transformers/main/en/llm_tutorial']], tab: 'flow',
+    l: [['Hugging Face: generation with LLMs', 'https://huggingface.co/docs/transformers/main/en/llm_tutorial']], tab: 'walk',
   },
   {
     t: 'Prefill', aka: 'prompt processing', g: 'Running the model',
@@ -182,11 +182,11 @@ const GLOSSARY = [
   {
     t: 'KV cache', aka: 'key value cache', g: 'Running the model',
     d: 'Keys and values of past positions never change, so they are stored instead of recomputed. Each new token then costs one position\'s work, not the whole prefix again. Here: 30 layers × (k + v) × 3 heads × 64 numbers × 4 bytes = 46 KB per token. Rewinding generation just truncates this cache.',
-    l: [['Hugging Face: KV cache', 'https://huggingface.co/docs/transformers/main/en/kv_cache']], tab: 'kv',
+    l: [['Hugging Face: KV cache', 'https://huggingface.co/docs/transformers/main/en/kv_cache']],
   },
   {
     t: 'Context window', aka: 'context length max positions', g: 'Running the model',
-    d: 'How many tokens the model can take into account at once. SmolLM2 was trained on 8,192; this page uses 2,048 in chat and 512 in the inspector, which keeps every activation of every position. Anything beyond the window simply doesn\'t exist for the model.',
+    d: 'How many tokens the model can take into account at once. SmolLM2 was trained on 8,192; this page uses 512, because it keeps every activation of every position. Anything beyond the window simply doesn\'t exist for the model.',
     l: [W('Large_language_model')],
   },
   {
@@ -243,7 +243,7 @@ const GLOSSARY = [
   },
   {
     t: 'Temperature', aka: 'temp', g: 'Output and sampling',
-    d: 'Divide the logits by T before softmax. T < 1 sharpens the distribution (more predictable), T > 1 flattens it (more surprising), T → 0 is greedy. The model card recommends 0.2 for chat.',
+    d: 'Divide the logits by T before softmax. T < 1 sharpens the distribution (more predictable), T > 1 flattens it (more surprising), T → 0 is greedy. The default preset here is greedy (T = 0).',
     l: [['Hugging Face: how to generate text', 'https://huggingface.co/blog/how-to-generate'], W('Softmax_function')], tab: 'next',
   },
   {
@@ -258,12 +258,12 @@ const GLOSSARY = [
   },
   {
     t: 'Repetition penalty', aka: 'repeat penalty frequency presence', g: 'Output and sampling',
-    d: 'Lower the logit of every token that already appeared recently (divide a positive logit by the penalty, multiply a negative one). It fights loops, but bluntly: answers legitimately repeat words, and in chat it even penalizes <|im_end|>. Off by default here, in favour of DRY.',
+    d: 'Lower the logit of every token that already appeared recently (divide a positive logit by the penalty, multiply a negative one). It fights loops, but bluntly: real text legitimately repeats words like "the" and "is", and the penalty pushes them down too. Off by default here, in favour of DRY.',
     l: [ARXIV('1909.05858', 'Keskar et al. 2019, CTRL (introduced it)')], tab: 'next',
   },
   {
     t: 'DRY ("don\'t repeat yourself")', aka: 'dry anti-loop sampler', g: 'Output and sampling',
-    d: 'Penalizes only a token that would continue a sequence that already appeared earlier, and harder the longer that repeat is: multiplier × base^(length − 2). Single repeated words are free; "I went to the office. I went to the" is stopped. It took loops on long replies from 8 in 10 to 0 here.',
+    d: 'Penalizes only a token that would continue a sequence that already appeared earlier, and harder the longer that repeat is: multiplier × base^(length − 2). Single repeated words are free; "I went to the office. I went to the" is stopped. It is on by default here.',
     l: [['p-e-w: the original DRY proposal', 'https://github.com/oobabooga/text-generation-webui/pull/5677']], tab: 'next',
   },
 
@@ -281,21 +281,21 @@ const GLOSSARY = [
   {
     t: 'Logit lens', aka: 'lens early decoding', g: 'Looking inside',
     d: 'Apply the final norm and output head to the residual stream after an intermediate layer, as if the model stopped there. You see what it "would predict" at each depth, and where the answer appears. It works because every layer writes into the same stream the output head reads.',
-    l: [['nostalgebraist: interpreting GPT, the logit lens', 'https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens']], tab: 'lens',
+    l: [['nostalgebraist: interpreting GPT, the logit lens', 'https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens']],
   },
   {
     t: 'Direct logit attribution', aka: 'dla logit attribution contribution write', g: 'Looking inside',
-    d: 'The final logits are the unembedding applied to the normalized residual stream, and the stream is a sum of writes. Freeze the final RMSNorm\'s divisor at its real value and each write\'s effect on every logit becomes exact and additive: you can say "layer 23\'s attention added +5.4 to the logit of \' Berlin\'". The Flow tab uses it to read any write, head or neuron as tokens.',
-    l: [['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html'], ['nostalgebraist: interpreting GPT, the logit lens', 'https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens']], tab: 'flow',
+    d: 'The final logits are the unembedding applied to the normalized residual stream, and the stream is a sum of writes. Freeze the final RMSNorm\'s divisor at its real value and each write\'s effect on every logit becomes exact and additive: you can say "layer 23\'s attention added +5.4 to the logit of \' Berlin\'".',
+    l: [['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html'], ['nostalgebraist: interpreting GPT, the logit lens', 'https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens']], tab: 'walk',
   },
   {
     t: 'Ablation', aka: 'ablate knock out', g: 'Looking inside',
-    d: 'Switch a part of the model off (here: zero an attention head\'s output) and see what changes. If the prediction collapses, that part mattered for this input. The Attention tab lets you ablate any of the 270 heads.',
-    l: [W('Ablation_(artificial_intelligence)')], tab: 'attn',
+    d: 'Switch a part of the model off (here: zero an attention head\'s output) and see what changes. If the prediction collapses, that part mattered for this input.',
+    l: [W('Ablation_(artificial_intelligence)')], tab: 'walk',
   },
   {
     t: 'Mechanistic interpretability', aka: 'circuits interpretability', g: 'Looking inside',
-    d: 'The research field that tries to reverse-engineer what algorithms trained networks implement, from weights and activations, instead of treating them as black boxes. Tools like this page (hooks, lens, ablation) are its basic instruments.',
+    d: 'The research field that tries to reverse-engineer what algorithms trained networks implement, from weights and activations, instead of treating them as black boxes. Hooks, the logit lens and ablation are its basic instruments.',
     l: [W('Mechanistic_interpretability'), ['Anthropic: A Mathematical Framework for Transformer Circuits', 'https://transformer-circuits.pub/2021/framework/index.html']],
   },
   {
@@ -322,7 +322,7 @@ const GLOSSARY = [
   },
   {
     t: 'Supervised fine-tuning (SFT)', aka: 'instruction tuning fine-tuning instruct', g: 'Training',
-    d: 'Continue training the base model on example conversations written in the chat template, so it learns to answer as an assistant and to end its turn with <|im_end|>. The "-Instruct" in the name means this was done (on the smol-smoltalk dataset).',
+    d: 'Continue training the base model on example conversations written in the chat template, so it learns to answer as an assistant and to end its turn. SmolLM2-135M-Instruct got this (on the smol-smoltalk dataset); the base model on this page did not.',
     l: [W('Fine-tuning_(deep_learning)')],
   },
   {

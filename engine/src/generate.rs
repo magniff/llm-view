@@ -38,7 +38,7 @@ impl GenStats {
 }
 
 /// Run generation. `prompt` is appended to whatever is already in `cache`
-/// (so multi-turn chat only pays for the new tokens). `on_text` receives
+/// (so continuing a text only pays for the new tokens). `on_text` receives
 /// decoded text as it becomes printable.
 ///
 /// Every token in the returned `generated` list has been fed through the

@@ -3,14 +3,14 @@
 //
 //   scripts/build-web.sh && node scripts/test-wasm.mjs
 //
-// Needs models/smollm2-135m-instruct/ and golden/ (reference/dump_golden.py).
+// Needs models/smollm2-135m/ and golden/ (reference/dump_golden.py).
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const modelDir = root + 'models/smollm2-135m-instruct/';
+const modelDir = root + 'models/smollm2-135m/';
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 let ex, lastPanic = '';
@@ -43,10 +43,10 @@ await test('load weights tensor by tensor', () => {
   const n = Number(new DataView(w.buffer, w.byteOffset, 8).getBigUint64(0, true));
   const { tensors } = JSON.parse(invoke(() => ex.init(
     ...strIn(readFileSync(modelDir + 'config.json', 'utf8')), ...strIn(readFileSync(modelDir + 'tokenizer.json', 'utf8')),
-    ...bytesIn(w.subarray(8, 8 + n)), ...strIn('smollm2-135m-instruct'))));
+    ...bytesIn(w.subarray(8, 8 + n)), ...strIn('smollm2-135m'))));
   assert.equal(tensors.length, 272);
   for (const [name, a, b] of tensors) invoke(() => ex.put_tensor(...strIn(name), ...bytesIn(w.subarray(8 + n + a, 8 + n + b))));
-  invoke(() => ex.finish(256, 1024));
+  invoke(() => ex.finish(256));
   assert.ok(ex.memory.buffer.byteLength < 700e6, `wasm memory ${ex.memory.buffer.byteLength}`);
 });
 
@@ -57,18 +57,11 @@ await test('tokenizer matches HF', () => {
   }
 });
 
-await test('greedy chat replies match HF', () => {
-  for (const c of JSON.parse(readFileSync(root + 'golden/chat.json', 'utf8'))) {
-    call('chat_reset', {});
-    call('chat_send', { text: c.user });
-    const ids = [];
-    for (;;) {
-      const r = call('chat_step', { n: 8, temperature: 0, repeat_penalty: 1, dry: 0 });
-      ids.push(...r.tokens.map((t) => t.id));
-      if (r.done || ids.length >= c.reply_ids.length) break;
-    }
-    assert.deepEqual(ids.slice(0, c.reply_ids.length), c.reply_ids, c.user);
-  }
+await test('greedy continuation matches HF', () => {
+  const g = JSON.parse(readFileSync(root + 'golden/meta.json', 'utf8'));
+  call('run', { ids: g.gen_prompt_ids });
+  const r = call('step', { n: g.gen_ids.length, temperature: 0, repeat_penalty: 1, dry: 0 });
+  assert.deepEqual(r.tokens.slice(g.gen_prompt_ids.length).map((t) => t.id), g.gen_ids);
 });
 
 await test('decode after prefill is bit-identical to a full prefill', () => {
@@ -80,11 +73,11 @@ await test('decode after prefill is bit-identical to a full prefill', () => {
 
 await test('errors come back as errors, not traps', () => {
   assert.throws(() => call('nope', {}), /unknown method/);
-  assert.throws(() => call('attn', { layer: 999 }), /no such layer/);
+  assert.throws(() => call('walk_layer', { layer: 999 }), /no such layer/);
   // usize is 32-bit here: 2^32 must be rejected, not wrapped to layer 0.
-  assert.throws(() => call('attn', { layer: 2 ** 32 }), /non-negative integer/);
+  assert.throws(() => call('walk_layer', { layer: 2 ** 32 }), /non-negative integer/);
   assert.throws(() => call('run', { ids: [2 ** 32 + 5] }), /token ids/);
-  assert.throws(() => call('chat_step', { repeat_penalty: 0 }), /repeat_penalty/);
+  assert.throws(() => call('step', { repeat_penalty: 0 }), /repeat_penalty/);
   call('state'); // still alive
 });
 

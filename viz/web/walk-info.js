@@ -1,6 +1,6 @@
 'use strict';
 // Longer explanations for the Step-by-step tab: one per step, in prose, with
-// further reading. Shown when the step's info button is on. **bold**,
+// further reading. Shown when the step's info button is on. **bold**, *italic*,
 // `code` and $TeX$ are the only markup. Every link was checked to resolve to the page or
 // video named here.
 
@@ -37,7 +37,9 @@ const L_ = {
   bpe: ['paper', 'Sennrich et al. 2015, Neural Machine Translation of Rare Words with Subword Units (BPE for NLP)', WI_ARXIV('1508.07909')],
   hfBpe: ['article', 'Hugging Face LLM course, Byte-Pair Encoding tokenization', 'https://huggingface.co/learn/llm-course/chapter6/5'],
   smol: ['paper', 'Allal et al. 2025, SmolLM2: When Smol Goes Big (this model)', WI_ARXIV('2502.02737')],
-  card: ['article', 'SmolLM2-135M-Instruct model card', 'https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct'],
+  card: ['article', 'SmolLM2-135M model card', 'https://huggingface.co/HuggingFaceTB/SmolLM2-135M'],
+  lens: ['article', 'nostalgebraist 2020, interpreting GPT: the logit lens', 'https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens'],
+  tunedLens: ['paper', 'Belrose et al. 2023, Eliciting Latent Predictions from Transformers with the Tuned Lens', WI_ARXIV('2303.08112')],
   w: (page, label) => ['wiki', label || decodeURIComponent(page).replace(/_/g, ' '), WI_WIKI(page)],
 };
 
@@ -46,7 +48,7 @@ const WALK_INFO = {
     p: [
       'A neural network computes with numbers, so the first job is to turn text into a sequence of integers. SmolLM2 uses **byte-pair encoding (BPE)**: training started from the 256 possible bytes and repeatedly merged the most frequent adjacent pair in a large text corpus into a new vocabulary entry, until there were 49,152 entries. Frequent words end up as single tokens; rare words are spelled out of a few pieces.',
       'Because the base units are bytes, any text at all can be encoded: there is no "unknown word". Before merging, a pre-tokenizer splits the text into rough words, and the space in front of a word stays attached to it. That is why `" capital"` (with its space) and `"capital"` are different tokens with unrelated ids. This tokenizer also splits every digit into its own token, which is one reason the model does arithmetic digit by digit (and not very well).',
-      'Everything downstream is counted in tokens: the context window (8,192 tokens for this model; the chat on this site keeps 2,048), the compute per step, the KV cache. The tokenizer is fixed before the model is trained and never changes afterwards.',
+      'Everything downstream is counted in tokens: the context window (8,192 tokens for this model; this page keeps 512), the compute per step, the KV cache. The tokenizer is fixed before the model is trained and never changes afterwards.',
     ],
     links: [L_.w('Byte_pair_encoding'), L_.hfBpe, L_.ytTok, L_.bpe, L_.w('Lexical_analysis')],
   },
@@ -165,7 +167,7 @@ const WALK_INFO = {
   o: {
     p: [
       'The **output projection** `o_proj` maps the concatenated head outputs back into the stream\'s 576 dimensions. Because concatenation followed by a matrix multiply is the same as each head multiplying by its own 64-column slice of the matrix and summing, you can equally say: every head writes its own vector into the stream, and the writes add up.',
-      'That per-head view is what interpretability work uses to ask what an individual head contributes (the Flow tab, hidden for now, shows each head\'s write).',
+      'That per-head view is what interpretability work uses to ask what an individual head contributes.',
     ],
     links: [L_.circuits, L_.aiayn],
   },
@@ -213,17 +215,21 @@ const WALK_INFO = {
   add2: {
     p: [
       'The MLP\'s write is added to the stream, and the layer is complete: same shape in, same shape out, `[T, 576]`. That uniform shape is what makes the architecture stackable: layer 1 cannot tell whether its input came from the embeddings or from 29 earlier layers.',
-      'A consequence worth knowing: since the stream always lives in the same space, you can apply the final norm and the output projection to it after *any* layer and read off what the model "would predict now". That trick is called the logit lens.',
-    ],
-    links: [L_.resnet, L_.circuits],
-  },
-  repeat: {
-    p: [
+      'A consequence worth knowing: since the stream always lives in the same space, you can apply the final norm and the output projection to it after *any* layer and read off what the model "would predict now". That trick is called the logit lens; the next step, the peek, does exactly that.',
       'SmolLM2-135M has 30 identical layers, each with its own 9 weight tensors: about 3.54 million parameters per layer (0.88 M attention, 2.65 M MLP). With the 28.3 M embedding table that comes to 134.5 million, the "135M" in the name.',
       'The layers do not have assigned roles, but loose patterns show up in many models: early layers handle local, surface-level structure, middle layers assemble meaning and recall facts, and late layers turn that into a concrete prediction. Bigger models mostly add more and wider layers of the same kind.',
     ],
-    links: [L_.smol, L_.card, L_.ytGpt, L_.ytDeep],
+    links: [L_.resnet, L_.circuits, L_.smol],
   },
+  lens: {
+    p: [
+      'The stream has the same shape after every layer, so nothing stops us from sending it through the output head early: the final RMSNorm, then a dot product with every row of the embedding table, then softmax. This is the **logit lens**. Each row gives a distribution for the token after it, exactly as at the real output.',
+      'Read it with one caveat: the model was only ever trained to have its *last* layer read this way. Earlier layers are free to keep information in directions the output table ignores, so their read-outs are rough. In early layers they often just echo the current token, or something associated with it; the real prediction usually takes shape in the middle and late layers, and the last column shows when the final answer reaches the top.',
+      'The tuned lens improves on this by learning a small correction for each layer before reading it out. Here we use the plain version, with nothing learned: what you see comes straight from the stream.',
+    ],
+    links: [L_.lens, L_.tunedLens, L_.circuits],
+  },
+
   fnorm: {
     p: [
       'After the last layer, the stream gets one final RMSNorm with its own gain (`model.norm.weight`). The output projection that follows expects a normalised input, just as every block did.',
@@ -240,7 +246,7 @@ const WALK_INFO = {
   probs: {
     p: [
       'Softmax over the 49,152 logits gives the next-token distribution. Every row predicts the token that follows it, so one pass over a prompt yields T predictions at once. Training uses exactly that: the loss is the **cross-entropy**, the average of −log(probability given to the actual next token), over every position of trillions of tokens of text.',
-      'Generation uses only the last row. A sampler picks a token from it (temperature, top-p and the penalties in the controls above all act here, after the model), the token is appended, and the next forward pass only needs to process that one new token, because the keys and values of everything before it are already in the KV cache.',
+      'Generation uses only the last row. A sampler picks a token from it (temperature, top-p and the penalties in the Sampler menu all act here, after the model), the token is appended, and the next forward pass only needs to process that one new token, because the keys and values of everything before it are already in the KV cache.',
     ],
     links: [L_.w('Softmax_function'), L_.w('Cross-entropy'), L_.ytDeep, L_.ytGpt],
   },
@@ -248,8 +254,9 @@ const WALK_INFO = {
 
 // **bold**, `code` and $maths$ → nodes.
 function infoText(s) {
-  return s.split(/(\*\*[^*]+\*\*|`[^`]+`|\$[^$]+\$)/).filter(Boolean).map((part) =>
+  return s.split(/(\*\*[^*]+\*\*|\*[^*\s][^*]*\*|`[^`]+`|\$[^$]+\$)/).filter(Boolean).map((part) =>
     part.startsWith('**') ? el('b', { text: part.slice(2, -2) })
+      : part.startsWith('*') && part.length > 2 && part.endsWith('*') ? el('em', { text: part.slice(1, -1) })
       : part.startsWith('`') ? el('code', { text: part.slice(1, -1) })
         : part.startsWith('$') ? tex(part.slice(1, -1))
           : part);

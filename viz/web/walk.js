@@ -2,12 +2,82 @@
 // The Step-by-step tab: the forward pass one operation at a time, on the whole
 // prompt at once, the way the engine computes it. Every step is a matrix
 // operation on [tokens, …] matrices (rows = tokens), with the checkpoint's
-// tensor names, the shapes, and the real numbers. Next/Back (or ←/→) move one
-// operation; one layer is walked in full, the other 29 repeat it.
+// tensor names, the shapes, and the real numbers. Next/Previous (or ←/→) move one
+// operation; past the end of a layer they continue into the next one. Each
+// layer ends with a "peek" (the logit lens: not part of the model), and the
+// output head appears only after the last layer, where the model runs it.
 //
-// Loaded after flow.js and before app.js; uses their helpers at call time.
+// Loaded before app.js; uses its helpers (el, S, call, …) at call time.
 
 const WALK = { step: 'tok', layer: 0, info: false }; // info: the prose explanation is open (stays open across steps)
+
+// ------------------------------------------------------------------ small helpers
+
+// A number at a readable precision.
+const fv = (x) => {
+  const a = Math.abs(x);
+  return a === 0 ? '0' : a >= 1000 ? x.toFixed(0) : a >= 10 ? x.toFixed(1) : a >= 0.01 ? x.toFixed(3) : x.toExponential(1);
+};
+const vnorm = (v) => Math.sqrt(v.reduce((s, x) => s + x * x, 0));
+
+// 98th percentile of |v|: one huge coordinate (they exist: see "massive
+// activations") would otherwise turn the rest of the grid black.
+function robustMax(v) {
+  const a = Array.from(v, Math.abs).sort((x, y) => x - y);
+  return Math.max(a[Math.floor((a.length - 1) * 0.98)], a[a.length - 1] * 0.02, 1e-6);
+}
+
+function ropeDials(pos) {
+  const m = S.st.model, half = m.head_dim / 2, cell = 23, cols = 16, rad = 8.5;
+  const ang = (i) => pos * Math.pow(m.rope_theta, (-2 * i) / m.head_dim);
+  const c = el('canvas');
+  const g = hiDPI(c, cols * cell, Math.ceil(half / cols) * cell);
+  for (let i = 0; i < half; i++) {
+    const cx = (i % cols) * cell + cell / 2, cy = Math.floor(i / cols) * cell + cell / 2, a = ang(i);
+    g.strokeStyle = '#2b3550'; g.lineWidth = 1.2;
+    g.beginPath(); g.arc(cx, cy, rad, 0, 7); g.stroke();
+    g.strokeStyle = '#8b7dff'; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(cx, cy); g.lineTo(cx + rad * Math.cos(-a), cy + rad * Math.sin(-a)); g.stroke();
+  }
+  c.onmousemove = (e) => {
+    const r = c.getBoundingClientRect();
+    const i = Math.floor((e.clientY - r.top) / cell) * cols + Math.floor((e.clientX - r.left) / cell);
+    if (i < 0 || i >= half) return hideTip();
+    const a = ang(i);
+    showTip(e, el('b', { text: `pair (${i}, ${i + half})` }),
+      el('div', { text: `turns ${Math.pow(m.rope_theta, (-2 * i) / m.head_dim).toPrecision(3)} rad per position` }),
+      el('div', { text: `at position ${pos}: ${a.toPrecision(4)} rad = ${(a / (2 * Math.PI)).toPrecision(3)} turns` }));
+  };
+  c.onmouseleave = hideTip;
+  return c;
+}
+
+function siluPlot(gate, hidden) {
+  const W = 250, H = 150, pad = 22;
+  const lo = Math.max(-8, Math.min(...gate)), hi = Math.min(8, Math.max(...gate, 1));
+  const silu = (x) => x / (1 + Math.exp(-x));
+  const ylo = -0.4, yhi = Math.max(silu(hi), 1);
+  const X = (x) => pad + ((x - lo) / (hi - lo)) * (W - pad - 6), Y = (y) => H - pad - ((y - ylo) / (yhi - ylo)) * (H - pad - 8);
+  const c = el('canvas');
+  const g = hiDPI(c, W, H);
+  g.strokeStyle = 'rgba(148,163,214,.25)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(pad, Y(0)); g.lineTo(W, Y(0)); g.moveTo(X(0), 4); g.lineTo(X(0), H - pad); g.stroke();
+  g.strokeStyle = '#8b7dff'; g.lineWidth = 1.5; g.beginPath();
+  for (let i = 0; i <= 100; i++) { const x = lo + ((hi - lo) * i) / 100; i ? g.lineTo(X(x), Y(silu(x))) : g.moveTo(X(x), Y(silu(x))); }
+  g.stroke();
+  const hm = Math.max(...hidden.map(Math.abs), 1e-9);
+  gate.forEach((x, i) => {
+    if (x < lo || x > hi) return;
+    const k = Math.abs(hidden[i]) / hm;
+    g.fillStyle = `rgba(240,160,80,${0.15 + 0.85 * Math.sqrt(k)})`;
+    g.fillRect(X(x) - 1.2, Y(silu(x)) - 1.2, 2.4, 2.4);
+  });
+  g.fillStyle = '#8b95ad'; g.font = '9.5px ui-monospace, Menlo, monospace'; g.textAlign = 'center';
+  g.fillText('gate', W / 2, H - 6);
+  g.fillText(String(Math.round(lo)), X(lo) + 6, H - 6); g.fillText(String(Math.round(hi)), X(hi) - 6, H - 6);
+  g.textAlign = 'left'; g.fillText('silu(gate)', pad + 2, 10);
+  return c;
+}
 
 // ------------------------------------------------------------------ pieces
 
@@ -90,6 +160,30 @@ function nums(rows, o = {}) {
 const wop = (t) => el('span', { class: 'wop', text: t });
 const wrow = (...kids) => el('div', { class: 'wrow' }, ...kids);
 const wnote = (...parts) => el('p', { class: 'wnote' }, ...parts);
+
+// A token as text, with the space / newline markers dimmed so "·love" reads as "love".
+// A token made only of whitespace keeps its markers bright: they are all there is to see.
+const wtokText = (text) => (/^[·↵⇥∅]+$/.test(vis(text)) ? vis(text) : vis(text).split(/([·↵⇥∅])/).filter(Boolean)
+  .map((x) => (/^[·↵⇥∅]$/.test(x) ? el('span', { class: 'wsp', text: x }) : x)));
+
+// One candidate: the token over its value, shaded by its probability.
+function wcand(text, value, p, cls = '') {
+  const c = el('span', { class: 'wcand ' + cls }, el('span', { class: 'wct' }, wtokText(text)), el('span', { class: 'wcv', text: value }));
+  if (p != null) c.style.setProperty('--p', Math.min(1, Math.sqrt(p)).toFixed(3));
+  return c;
+}
+
+// Prediction rows: for each position, the token it sits after, then columns of chips.
+// cols: [header, (y) => content]; the first column is always the row's own token.
+function wpreds(c, cols, note = () => null) {
+  return el('div', { class: 'wpreds', style: `grid-template-columns: auto ${cols.map((x) => x[2] || 'auto').join(' ')}` },
+    el('span', { class: 'wph', text: 'after' }), cols.map(([h]) => el('span', { class: 'wph', text: h })),
+    c.idx.map((y) => [
+      el('span', { class: 'wpctx' + (y === c.T - 1 ? ' last' : '') },
+        el('span', { class: 'wct' }, wtokText(wtok(y).text)), note(y) ? el('span', { class: 'wcv', text: note(y) }) : null),
+      cols.map(([, f]) => el('div', { class: 'wcands' }, f(y))),
+    ]));
+}
 
 // Per-head [T, T] grids. kind: 'score' (diverging, optional causal mask) or 'prob' (heat).
 function attnGrids(mats, kind, o = {}) {
@@ -297,40 +391,48 @@ function wsteps(L) {
       body: (c) => [wrow(mat('x′', c.D.x_mid), wop('+'), mat('Δ MLP', c.D.d_mlp), wop('='), mat(`x″ (layer ${L + 1 < NL ? L + 1 : 'output'} input)`, c.D.x_out)),
         nums(c.D.x_out, { extra: ['‖x′‖ → ‖Δ‖', (y) => `${fv(vnorm(c.D.x_mid[y]))} + ${fv(vnorm(c.D.d_mlp[y]))}`] }),
         wnote(`Layer ${L} is done: x″ is what layer ${L + 1 < NL ? L + 1 : '(none: this was the last)'} receives. Same shape it started with.`)] },
-    { id: 'repeat', part: 'Output', title: L + 1 < NL ? `Layers ${L + 1} … ${NL - 1}: the same again` : 'All layers done',
-      body: () => [
+    { id: 'lens', part: 'Read-out', title: L + 1 < NL ? `What the stream would predict if the model stopped after layer ${L}` : `What the stream predicts after layer ${L}`,
+      tex: String.raw`\text{logits}^{(${L})} = \left( \frac{x''}{\operatorname{rms}(x'')} \odot g_f \right) E^{\top}`, dims: `${shape(c0().T, d)} → ${shape(c0().T, d)} × ${shape(d, V)} → ${shape(c0().T, V)}`,
+      weights: [['model.norm.weight', [d], 'the final norm\'s gain, borrowed', 'g_f'], ['model.embed_tokens.weight', [V, d], 'the output table, borrowed', 'E']],
+      body: (c) => [
+        mat(`x″ (layer ${L} output)`, c.D.x_out),
+        wpreds(c, [
+          [`top 5 if read out after layer ${L}`, (y) => c.Z.rows[y].top.map(([, t, , pr], i) => wcand(t, pct(pr), pr, i === 0 ? 'first' : '')), '1fr'],
+          [L + 1 < NL ? `the full model's pick (after layer ${NL - 1}): its odds after layer ${L}` : `the full model's pick (after layer ${NL - 1})`, (y) => {
+            const [, ft, fp, rank] = c.Z.rows[y].final;
+            return wcand(ft, `${pct(fp)} · ${rank === 0 ? 'top' : 'rank ' + (rank + 1).toLocaleString()}`, fp, rank === 0 ? 'good' : 'answer');
+          }],
+        ], (y) => `rms ${fv(c.Z.rows[y].rms)}`),
         wnote(L + 1 < NL
-          ? ['Every layer repeats exactly these steps with its own weights (', String(NL), ' layers, ', B('9 tensors each'), '). Each reads the stream and adds an attention write and an MLP write. ',
-            'Walk the next layer in full, or jump to the end, where the last row of the stream becomes the prediction.']
-          : ['That was the last of the ', String(NL), ' layers. Next: the stream becomes a prediction.']),
-        el('div', { class: 'wjump' },
-          L + 1 < NL ? el('button', { type: 'button', onclick: () => { WALK.layer = L + 1; WALK.step = 'stream'; renderTab(); } }, `Walk layer ${L + 1} →`) : null,
-          L + 1 < NL ? el('button', { type: 'button', onclick: () => { WALK.layer = NL - 1; WALK.step = 'stream'; renderTab(); } }, `Walk the last layer (${NL - 1}) →`) : null,
-          el('button', { type: 'button', class: 'primary', onclick: () => { WALK.step = 'fnorm'; renderTab(); } }, 'Skip to the output →')),
-      ] },
-    { id: 'fnorm', part: 'Output', title: 'Final RMSNorm', tex: String.raw`x_f = \frac{x}{\operatorname{rms}(x)} \odot g_f`, dims: `${shape(c0().T, d)}`,
+          ? ['Not a step the model takes: a peek. The model sends x″ straight into layer ', String(L + 1), '; here we also run a copy of it through the final norm and the output table, as if layers ', String(L + 1), '…', String(NL - 1), ' were skipped. ',
+            'The last column follows the token the full model ends up predicting for that row: its probability and rank (out of ', V.toLocaleString(), ') at this depth. ',
+            'Walk other layers with the layer picker to watch it climb.']
+          : ['This is the last layer, so the peek is the real prediction: the same numbers as the Output steps that follow.']),
+        L + 1 < NL ? el('div', { class: 'wjump' },
+          el('button', { type: 'button', onclick: () => walkLayer(L + 1, 'stream') }, `On to layer ${L + 1} →`),
+          el('button', { type: 'button', onclick: () => walkLayer(NL - 1, 'fnorm') }, `Skip to the output, after layer ${NL - 1} →`)) : null] },
+    { id: 'fnorm', part: 'Output', only: () => L === NL - 1, title: 'Final RMSNorm', tex: String.raw`x_f = \frac{x}{\operatorname{rms}(x)} \odot g_f`, dims: `${shape(c0().T, d)}`,
       weights: [['model.norm.weight', [d], null, 'g_f']],
       body: (c) => [wrow(mat(`x after all ${NL} layers`, c.E.out.map((o) => o.x)), wop('→'), mat('xf', c.E.out.map((o) => o.xn))),
         nums(c.E.out.map((o) => o.x), { extra: ['rms', (y) => fv(c.E.out[y].rms)], head: 'x, first 6' }),
         wnote('One last normalisation of the stream after layer ', String(NL - 1), '. Compare the row lengths with the embeddings: the layers made them much larger.')] },
-    { id: 'logits', part: 'Output', title: 'Logits: compare with every token', tex: String.raw`\text{logits} = x_f \, E^{\top}`, dims: `${shape(c0().T, d)} × ${shape(d, V)} → ${shape(c0().T, V)}`,
+    { id: 'logits', part: 'Output', only: () => L === NL - 1, title: 'Logits: compare with every token', tex: String.raw`\text{logits} = x_f \, E^{\top}`, dims: `${shape(c0().T, d)} × ${shape(d, V)} → ${shape(c0().T, V)}`,
       weights: [['model.embed_tokens.weight', [V, d], 'the same table as the input ("tied" embeddings)', 'E']],
       body: (c) => [
-        el('table', { class: 'wnums' }, el('tr', {}, el('th', { text: 'row' }), el('th', { text: `top 5 of ${V.toLocaleString()} logits` })),
-          c.idx.map((y) => el('tr', {}, el('td', { class: 'mono', text: JSON.stringify(wtok(y).text) }),
-            el('td', { class: 'mono', text: c.E.out[y].top.map(([, t, l]) => `${vis(t)} ${fv(l)}`).join(' · ') })))),
+        wpreds(c, [[`top 5 of ${V.toLocaleString()} logits`, (y) => c.E.out[y].top.map(([, t, l], i) => wcand(t, fv(l), null, i === 0 ? 'first' : '')), '1fr']]),
         wnote('Each row is compared, by dot product, with all ', V.toLocaleString(), ' rows of the embedding table: the very table that turned ids into vectors at the start. ',
           'A high logit means the row points the same way as that token\'s embedding.')] },
-    { id: 'probs', part: 'Output', title: 'Softmax: logits → next-token probabilities', tex: String.raw`p_{iv} = \frac{e^{\,\text{logits}_{iv}}}{\sum_{u=1}^{${V}} e^{\,\text{logits}_{iu}}}`, dims: `${shape(c0().T, V)}, each row sums to 1`,
+    { id: 'probs', part: 'Output', only: () => L === NL - 1, title: 'Softmax: logits → next-token probabilities', tex: String.raw`p_{iv} = \frac{e^{\,\text{logits}_{iv}}}{\sum_{u=1}^{${V}} e^{\,\text{logits}_{iu}}}`, dims: `${shape(c0().T, V)}, each row sums to 1`,
       body: (c) => [
-        el('table', { class: 'wnums' }, el('tr', {}, el('th', { text: 'after' }), el('th', { text: 'predicts' }), el('th', { text: 'actually next' })),
-          c.idx.map((y) => {
-            const top = c.E.out[y].top, nxt = y + 1 < S.st.tokens.length ? wtok(y + 1) : null;
-            return el('tr', { class: y === c.T - 1 ? 'wlast' : '' },
-              el('td', { class: 'mono', text: JSON.stringify(wtok(y).text) }),
-              el('td', { class: 'mono', text: top.slice(0, 3).map(([, t, , pr]) => `${vis(t)} ${pct(pr)}`).join(' · ') }),
-              el('td', { class: 'mono', text: nxt ? `${vis(nxt.text)}${nxt.id === top[0][0] ? '  ✓ top guess' : ''}` : 'not written yet' }));
-          })),
+        wpreds(c, [
+          ['predicts', (y) => c.E.out[y].top.map(([, t, , pr], i) => wcand(t, pct(pr), pr, i === 0 ? 'first' : '')), '1fr'],
+          ['actually next', (y) => {
+            const nxt = y + 1 < S.st.tokens.length ? wtok(y + 1) : null;
+            if (!nxt) return el('span', { class: 'wcv', text: 'not written yet' });
+            const hit = nxt.id === c.E.out[y].top[0][0];
+            return wcand(nxt.text, hit ? '✓ the top guess' : 'not the top guess', null, hit ? 'good' : 'answer');
+          }],
+        ]),
         wnote('Every row predicts the token after it, so one pass over a prompt checks ', String(c.T), ' predictions at once (that is how the model was trained). ',
           'Only the ', B('last row'), ' predicts something new: the sampler picks from it, the pick is appended, and the next pass needs only that one new row, because every earlier k and v is already in the KV cache.')] },
   ];
@@ -362,6 +464,17 @@ function oneHot(c) {
 // ------------------------------------------------------------------ the view
 
 function walkGo(id) { WALK.step = id; renderTab(); }
+function walkLayer(L, id) { WALK.layer = L; WALK.step = id; renderTab(); }
+
+// One step forward or back. Past the end of a layer, continue into the next
+// layer; back from a layer's first step, return to the previous layer's peek.
+function walkMove(d) {
+  const L = WALK.layer, NL = S.st.model.n_layers, steps = wsteps(L);
+  const k = steps.findIndex((s) => s.id === WALK.step), n = steps[k + d];
+  if (d > 0 && !n && L + 1 < NL) return walkLayer(L + 1, 'stream');
+  if (d < 0 && WALK.step === 'stream' && L > 0) return walkLayer(L - 1, 'lens');
+  if (n) walkGo(n.id);
+}
 
 const INFO_ICON = 'M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zm-.8 5.6h1.6V12H7.2zM8 3.8a1 1 0 1 1 0 2 1 1 0 0 1 0-2z';
 
@@ -370,17 +483,25 @@ async function viewWalk() {
   WALK.layer = L;
   const steps = wsteps(L);
   let k = steps.findIndex((s) => s.id === WALK.step);
-  if (k < 0) { k = 0; WALK.step = steps[0].id; }
+  if (k < 0) {
+    // An output step exists only on the last layer; elsewhere show the peek instead.
+    const id = ['fnorm', 'logits', 'probs'].includes(WALK.step) ? 'lens' : steps[0].id;
+    k = steps.findIndex((x) => x.id === id);
+    WALK.step = id;
+  }
   const s = steps[k];
-  const layerStep = s.part === 'Attention' || s.part === 'MLP';
+  const layerStep = s.part === 'Attention' || s.part === 'MLP' || s.part === 'Read-out';
   const E = await cached('walkends', 'walk_ends', null);
   const D = layerStep ? await cached('walk' + L, 'walk_layer', { layer: L }) : null;
+  const Z = s.id === 'lens' ? await cached('lens' + L, 'walk_lens', { layer: L }) : null;
   // Fetch the layer in the background while the input steps are on screen.
   if (!layerStep && !(('walk' + L) in S.cache)) { const cache = S.cache; call('walk_layer', { layer: L }).then((r) => (cache['walk' + L] = r)).catch(() => {}); }
-  const c = { T, idx: [...Array(T).keys()], sel: Math.min(S.sel, T - 1), E, D, L };
+  const c = { T, idx: [...Array(T).keys()], sel: Math.min(S.sel, T - 1), E, D, Z, L };
 
-  const go = (d) => { const n = steps[k + d]; if (n) walkGo(n.id); };
-  const partName = (pt) => (pt === 'Attention' || pt === 'MLP' ? `Layer ${L} · ${pt.toLowerCase()}` : pt);
+  const NL = m.n_layers, atEnd = k === steps.length - 1;
+  const partName = (pt) => (pt === 'Attention' || pt === 'MLP' ? `Layer ${L} · ${pt.toLowerCase()}`
+    : pt === 'Read-out' ? 'peek · not a real step' : pt === 'Output' ? `Output · after layer ${L}` : pt);
+  const partClass = (pt) => (pt === 'Read-out' ? ' peek' : pt === 'Output' ? ' out' : '');
   const parts = [];
   for (const [i, x] of steps.entries()) {
     if (!parts.length || parts[parts.length - 1].name !== x.part) parts.push({ name: x.part, steps: [] });
@@ -391,20 +512,20 @@ async function viewWalk() {
       st.tokens.length > 16 ? ` First 16 of ${st.tokens.length} tokens shown.` : '',
       st.tokens.length > 6 ? [' ', el('button', { type: 'button', class: 'linkish', onclick: () => { $('#prompt').value = 'The capital'; $('#run').click(); } }, 'Try a short prompt'), '.'] : ''),
     el('div', { class: 'wbar' },
-      el('button', { type: 'button', class: 'icon', title: 'previous step (←)', disabled: k === 0, onclick: () => go(-1) }, '‹'),
+      el('button', { type: 'button', title: 'previous step (←)', disabled: k === 0, onclick: () => walkMove(-1) }, s.id === 'stream' && L > 0 ? `‹ Layer ${L - 1}` : '‹ Previous'),
       el('div', { class: 'wtitle' },
-        el('span', { class: 'dim', text: `${partName(s.part)} · step ${k + 1} of ${steps.length}` }),
+        el('span', { class: 'dim' + partClass(s.part), text: `${s.part === 'Output' ? partName(s.part) : s.part === 'Read-out' ? `Peek, not part of the model · layer ${L} of 0–${NL - 1}` : `${s.part} · layer ${L} of 0–${NL - 1}`} · step ${k + 1} of ${steps.length}` }),
         el('b', { text: s.title })),
       el('button', { type: 'button', class: 'winfo-btn' + (WALK.info ? ' on' : ''), title: 'explain this step in prose, with links to read or watch', 'aria-pressed': String(WALK.info),
         onclick: () => { WALK.info = !WALK.info; renderTab(); } }, svgIcon(INFO_ICON), WALK.info ? 'Hide explanation' : 'Explain'),
       el('label', { class: 'wlayer', title: 'which layer to walk through' }, 'layer',
-        el('select', { onchange: (e) => { WALK.layer = +e.target.value; if (!layerStep && s.id !== 'repeat') return renderTab(); WALK.step = WALK.layer > 0 ? 'stream' : 'rms'; renderTab(); } },
+        el('select', { onchange: (e) => { WALK.layer = +e.target.value; if (!layerStep || s.id === 'lens') return renderTab(); WALK.step = WALK.layer > 0 ? 'stream' : 'rms'; renderTab(); } },
           [...Array(m.n_layers).keys()].map((i) => el('option', { value: i, text: String(i), selected: i === L })))),
-      el('button', { type: 'button', class: 'primary', title: 'next step (→)', disabled: k === steps.length - 1, onclick: () => go(1) }, 'Next ›')),
-    el('div', { class: 'wprog' }, parts.map((pt) => el('div', { class: 'wpart' },
+      el('button', { type: 'button', class: 'primary', title: 'next step (→)', disabled: atEnd && L === NL - 1, onclick: () => walkMove(1) }, atEnd && L + 1 < NL ? `Layer ${L + 1} ›` : 'Next ›')),
+    el('div', { class: 'wprog' }, parts.map((pt) => el('div', { class: 'wpart' + partClass(pt.name) },
       el('span', { class: 'dim', text: partName(pt.name) }),
       el('div', { class: 'wdots' }, pt.steps.map(([i, x]) => el('button', { type: 'button', class: 'wdot' + (i === k ? ' on' : i < k ? ' done' : ''), title: x.title, 'aria-label': x.title, onclick: () => walkGo(x.id) })))))),
-    el('section', { class: 'wcard' },
+    el('section', { class: 'wcard' + partClass(s.part) },
       WALK.info ? infoPanel(s.id) : null,
       s.tex ? wformula(s.tex, s.dims) : null,
       s.weights ? el('div', { class: 'wweights' }, s.weights.map(([n, dims, note, sym]) => wweight(n, dims, note, sym))) : null,
@@ -414,9 +535,8 @@ async function viewWalk() {
 
 document.addEventListener('keydown', (e) => {
   if (S.tab !== 'walk' || !S.st || e.altKey || e.ctrlKey || e.metaKey) return;
-  if (e.target.closest('input, textarea, select, [contenteditable]') || document.querySelector('dialog[open]')) return;
+  if (e.target.closest?.('input, textarea, select, [contenteditable]') || document.querySelector('dialog[open]')) return;
   if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
   e.preventDefault();
-  const steps = wsteps(WALK.layer), k = steps.findIndex((s) => s.id === WALK.step), n = steps[k + (e.key === 'ArrowRight' ? 1 : -1)];
-  if (n) walkGo(n.id);
+  walkMove(e.key === 'ArrowRight' ? 1 : -1);
 });

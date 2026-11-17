@@ -123,57 +123,6 @@ fn greedy_generation_matches_hf() {
     assert_eq!(got, want, "\n got: {:?}\nwant: {:?}", tok.decode(&got), tok.decode(&want));
 }
 
-fn instruct() -> &'static Model {
-    static M: OnceLock<Model> = OnceLock::new();
-    M.get_or_init(|| Model::load(format!("{ROOT}/models/smollm2-135m-instruct")).unwrap())
-}
-
-/// Our ChatML rendering + tokenization must equal HF's `apply_chat_template`,
-/// and the greedy reply through `generate` must match HF token for token.
-#[test]
-fn chat_template_and_reply_match_hf() {
-    use engine::chat::render_single;
-    use engine::generate::generate;
-    let cases: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(format!("{ROOT}/golden/chat.json")).unwrap()).unwrap();
-    let m = instruct();
-    let tok = tokenizer();
-    for c in cases.as_array().unwrap() {
-        let text = render_single(None, c["user"].as_str().unwrap());
-        assert_eq!(text, c["text"].as_str().unwrap(), "rendered template");
-        let prompt = tok.encode(&text);
-        assert_eq!(prompt, ids(&c["ids"]), "template token ids");
-
-        let want = ids(&c["reply_ids"]);
-        let mut cache = m.new_cache(512);
-        let stats = generate(m, &tok, &mut cache, &prompt, &mut Sampler::greedy(), 48, &[m.cfg.eos_token], &mut NoHooks, |_| {});
-        assert_eq!(stats.generated, want, "\n got: {:?}\nwant: {:?}", tok.decode(&stats.generated), tok.decode(&want));
-    }
-}
-
-/// After two turns, the cached token stream must be exactly the ChatML
-/// transcript of the conversation.
-#[test]
-fn conversation_transcript_is_chatml() {
-    use engine::chat::{Conversation, DEFAULT_SYSTEM};
-    use engine::generate::generate;
-    let m = instruct();
-    let tok = tokenizer();
-    let mut conv = Conversation::new(m, &tok, None, 512);
-    let mut expected = format!("<|im_start|>system\n{DEFAULT_SYSTEM}<|im_end|>\n");
-    for (turn, q) in ["Hi!", "What is 2+2?"].into_iter().enumerate() {
-        let prompt = conv.prompt_for(&tok, q);
-        let s = generate(m, &tok, &mut conv.cache, &prompt, &mut Sampler::greedy(), 24, &[m.cfg.eos_token], &mut NoHooks, |_| {});
-        conv.record(&tok, &prompt, &s.generated);
-        if turn > 0 {
-            expected.push_str("<|im_end|>\n"); // closes the previous assistant reply
-        }
-        expected += &format!("<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n{}", tok.decode(&s.generated));
-        assert_eq!(tok.decode(&conv.tokens), expected);
-        assert_eq!(conv.cache.len, conv.tokens.len());
-    }
-}
-
 /// Prompts generate() can't run are a no-op, not a panic: nothing generated,
 /// cache untouched, `on_text` never called.
 #[test]

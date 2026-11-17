@@ -27,31 +27,17 @@ pub const SMOLLM2_135M: ModelSpec = ModelSpec {
     weights_sha256: "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
 };
 
-pub const SMOLLM2_135M_INSTRUCT: ModelSpec = ModelSpec {
-    repo: "HuggingFaceTB/SmolLM2-135M-Instruct",
-    dir: "smollm2-135m-instruct",
-    weights_sha256: "5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c",
-};
-
 pub const SMOLLM2_360M: ModelSpec = ModelSpec {
     repo: "HuggingFaceTB/SmolLM2-360M",
     dir: "smollm2-360m",
     weights_sha256: "7aaff6661428bed033abba9522bec81938678642cca3181fe752b6ca9e1e540f",
 };
 
-pub const SMOLLM2_360M_INSTRUCT: ModelSpec = ModelSpec {
-    repo: "HuggingFaceTB/SmolLM2-360M-Instruct",
-    dir: "smollm2-360m-instruct",
-    weights_sha256: "e6bffe7435d7ddc10fd3b9a9efd429dafbacb1cb17015fb5562664e7532bf86e",
-};
-
-/// Look up a model by size and flavour.
-pub fn spec(size: &str, instruct: bool) -> Option<&'static ModelSpec> {
-    Some(match (size, instruct) {
-        ("135m", false) => &SMOLLM2_135M,
-        ("135m", true) => &SMOLLM2_135M_INSTRUCT,
-        ("360m", false) => &SMOLLM2_360M,
-        ("360m", true) => &SMOLLM2_360M_INSTRUCT,
+/// Look up a (base) model by size.
+pub fn spec(size: &str) -> Option<&'static ModelSpec> {
+    Some(match size {
+        "135m" => &SMOLLM2_135M,
+        "360m" => &SMOLLM2_360M,
         _ => return None,
     })
 }

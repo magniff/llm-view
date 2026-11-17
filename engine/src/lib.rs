@@ -12,16 +12,13 @@
 //! - [`sampler`]     — logits → next token (greedy / temperature / top-k / top-p)
 //! - [`hooks`]       — the observation / intervention interface
 //! - [`generate`]    — the prefill + decode loop
-//! - [`chat`]        — ChatML formatting and multi-turn conversations
-//! - [`trace`]       — a hook that records a whole session by position, plus the logit lens
-//! - [`flow`]      — one position through one layer in full detail, and where its information came from
+//! - [`trace`]       — a hook that records the residual stream of a whole session, by position
+//! - [`walk`]        — one position through one layer in full detail, for the Step-by-step view
 //! - [`session`]     — the visualizer's API: one session, driven by method + JSON args
 //! - [`download`]    — fetch model files from the Hugging Face Hub on first run
 
-pub mod chat;
 pub mod clock;
 pub mod download;
-pub mod flow;
 pub mod generate;
 pub mod hooks;
 pub mod kv_cache;
@@ -33,6 +30,7 @@ pub mod session;
 pub mod tensor;
 pub mod tokenizer;
 pub mod trace;
+pub mod walk;
 mod unicode_tables;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

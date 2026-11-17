@@ -34,9 +34,9 @@ pub struct Sampler {
     pub repeat_penalty: f32,
     /// How many recent tokens the repetition penalty looks at.
     pub repeat_window: usize,
-    /// Tokens the penalty never touches. Meant for the chat control tokens:
-    /// every prompt contains `<|im_end|>`, and penalizing it makes the model
-    /// reluctant to end its turn, so short answers turn into rambles.
+    /// Tokens the penalty never touches: the special control tokens (penalizing
+    /// `<|endoftext|>` would make the model reluctant to ever stop), and with
+    /// [`Self::words_only`] every token without a letter.
     pub no_penalty: Vec<u32>,
     /// DRY strength; 0 = disabled. 0.8 is the usual setting.
     pub dry_multiplier: f32,
@@ -45,7 +45,7 @@ pub struct Sampler {
     /// Repeats up to this many tokens are free.
     pub dry_allowed_len: usize,
     /// Tokens that end a DRY match, sorted (newlines, quotes, colons and the
-    /// chat control tokens): structure is supposed to repeat; prose isn't.
+    /// control tokens): structure is supposed to repeat; prose isn't.
     pub dry_breakers: Vec<u32>,
     /// Tokens DRY never penalizes, indexed by id (empty = none). For digits,
     /// operators and punctuation: "What is 100 + 200?" → "100 + 200 = 300"
@@ -136,12 +136,6 @@ impl Sampler {
         }
     }
 
-    /// `logits` after the history-based penalties: what [`Self::sample`] sees
-    /// inside [`Self::sample_with_history`].
-    pub fn adjust(&self, logits: &[f32], history: &[u32]) -> Vec<f32> {
-        self.penalized(logits, history).unwrap_or_else(|| logits.to_vec())
-    }
-
     /// Logits after the history-based penalties, or None if none apply.
     fn penalized(&self, logits: &[f32], history: &[u32]) -> Option<Vec<f32>> {
         // A penalty must be a positive factor; 0 or NaN would turn logits into
@@ -217,13 +211,6 @@ impl Sampler {
                 *x -= self.dry_penalty(len);
             }
         }
-    }
-
-    /// The distribution [`Self::sample`] draws from, after temperature, top-k
-    /// and top-p, most likely first. Greedy settings give the argmax with
-    /// probability 1.
-    pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
-        self.nucleus(logits).unwrap_or_else(|| vec![(argmax(logits), 1.0)])
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> u32 {

@@ -180,31 +180,6 @@ def main():
             indent=1,
         )
 
-    # ---- chat template + greedy reply with the instruct model ----------
-    from transformers import AutoTokenizer
-
-    inst_dir = os.path.join(ROOT, "models", "smollm2-135m-instruct")
-    inst_tok = AutoTokenizer.from_pretrained(inst_dir)
-    inst = AutoModelForCausalLM.from_pretrained(inst_dir, dtype=torch.float32)
-    chat = []
-    # Arithmetic and open-ended prompts too: sampler settings get tuned on
-    # these, so the plain greedy model underneath must be exactly HF's.
-    for q in ["What is the capital of France?", "Write a haiku about rust.", "What is 100 + 200?",
-              "compute 100 + 200", "What is 45 - 17?", "What is 1000 - 1?", "What is 9 times 8?", "What is love?"]:
-        msgs = [{"role": "user", "content": q}]
-        text = inst_tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
-        chat_ids = inst_tok(text, add_special_tokens=False)["input_ids"]
-        with torch.no_grad():
-            g = inst.generate(torch.tensor([chat_ids]), max_new_tokens=48, do_sample=False)
-        reply = g[0, len(chat_ids):].tolist()
-        if reply and reply[-1] == inst.config.eos_token_id:
-            reply = reply[:-1]
-        chat.append({"user": q, "text": text, "ids": chat_ids, "reply_ids": reply,
-                     "reply": inst_tok.decode(reply)})
-        print("chat:", q, "->", repr(inst_tok.decode(reply)))
-    with open(os.path.join(OUT, "chat.json"), "w") as f:
-        json.dump(chat, f, ensure_ascii=False, indent=1)
-
     print(f"prompt tokens: {T}, saved {len(acts)} tensors to golden/trace.safetensors")
     print("greedy continuation:", repr(tok.decode(new)))
 

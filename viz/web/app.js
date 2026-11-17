@@ -6,14 +6,7 @@ const $ = (s) => document.querySelector(s);
 const S = {
   st: null,        // /api/state
   sel: 0,          // selected position
-  layer: 0,
-  head: 0,
   tab: 'next',
-  mid: false,      // logit lens: include post-attention rows
-  lensColor: 'answer',
-  lensStride: 1,
-  kvWhich: 'k',
-  kvHead: 0,
   cache: {},       // per-state fetched views
   busy: false,
   renderGen: 0,
@@ -49,7 +42,7 @@ const fmtBytes = (b) => (b >= 1e6 ? (b / 1e6).toFixed(2) + ' MB' : (b / 1e3).toF
 
 const PARAMS = new URLSearchParams(location.search);
 const NATIVE = PARAMS.has('native');
-const MODEL = 'smollm2-135m-instruct';
+const MODEL = 'smollm2-135m';
 // Where the weights come from: the local dev server when the page itself is on
 // localhost (no 269 MB downloads while developing), Hugging Face otherwise.
 const IS_LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
@@ -60,7 +53,9 @@ const pending = new Map();
 let nextId = 1;
 
 function startWorker(onProgress) {
-  worker = new Worker('worker.js');
+  // Always the current worker (it is tiny): a cached old one next to a new
+  // app.js would speak an outdated protocol. The weights have their own cache.
+  worker = new Worker('worker.js?t=' + Date.now());
   worker.onmessage = (e) => {
     const m = e.data;
     if (m.progress) return onProgress(m.progress);
@@ -136,13 +131,6 @@ function divRGB(v) {
   return z.map((c, k) => Math.round(c + (end[k] - c) * t));
 }
 
-function legend(label, fn, lo, hi) {
-  const c = el('canvas', { width: 160, height: 10 });
-  const g = c.getContext('2d');
-  for (let x = 0; x < 160; x++) { g.fillStyle = fn(x / 159); g.fillRect(x, 0, 1, 10); }
-  return el('div', { class: 'legend' }, label ? el('span', { text: label }) : null, el('span', { text: lo }), c, el('span', { text: hi }));
-}
-
 // Range inputs show their fill as a gradient up to the thumb (--fill), and a
 // knob's <output> shows the value, or a word like "off" at a neutral setting.
 function syncRange(r) {
@@ -157,29 +145,6 @@ function syncRange(r) {
   }
 }
 document.addEventListener('input', (e) => { if (e.target.type === 'range') syncRange(e.target); });
-function setRange(sel, v) {
-  const r = $(sel);
-  r.value = v;
-  syncRange(r);
-}
-
-// A labelled slider with a value pill, as in the completion controls.
-function knob(id, label, min, max, step, value, title, words = {}) {
-  const out = el('output');
-  for (const [k, w] of Object.entries(words)) out.dataset[k] = w;
-  const r = el('input', { id, type: 'range', min, max, step, value });
-  const k = el('div', { class: 'knob', title }, el('span', { text: label }), r, out);
-  syncRange(r);
-  return k;
-}
-
-function slider(label, value, max, oninput) {
-  const out = el('b', { class: 'pill', text: String(value) });
-  const r = el('input', { type: 'range', min: 0, max, value });
-  syncRange(r);
-  r.addEventListener('input', () => { out.textContent = r.value; oninput(+r.value); });
-  return el('label', { class: 'slider' }, label, r, out);
-}
 
 function hiDPI(canvas, w, h) {
   const d = devicePixelRatio || 1;
@@ -212,27 +177,27 @@ function samp() {
 // ------------------------------------------------------------------ sampler presets
 //
 // One click sets every sampler knob. They run from "the model alone" to "the
-// sampler steps in a lot", so the effect of each intervention can be seen in
-// the chat tint (orange = the sampler overruled the model). Knobs a tab doesn't
-// have are skipped: completion has no wrap-up, chat has no top-k.
+// sampler steps in a lot": the Next token tab shows the model's distribution
+// next to what the sampler draws from.
 const PRESETS = [
-  { id: 'greedy', name: 'Greedy', s: { temp: 0, topp: 1, topk: 0, dry: 0, rep: 1, end: 0 },
-    about: 'Always the model\'s favourite token, nothing changed: the model alone. Right where it knows, but most long replies loop forever.' },
-  { id: 'focused', name: 'Focused', s: { temp: 0, topp: 0.9, topk: 0, dry: 0.8, rep: 1, end: 0.05 },
-    about: 'The model\'s favourite, unless anti-loop (DRY) sees a phrase repeating; in chat, wrap-up also nudges long replies to end. Overrules the model on ~3% of tokens. Same question, same answer.' },
-  { id: 'card', name: 'Model card', s: { temp: 0.2, topp: 0.9, topk: 0, dry: 0, rep: 1, end: 0 },
-    about: 'What Hugging Face recommends for SmolLM2: temperature 0.2, top-p 0.9, no penalties. A little variety (~5% overruled), but it still loops.' },
-  { id: 'balanced', name: 'Balanced', s: { temp: 0.2, topp: 0.9, topk: 0, dry: 0.8, rep: 1.1, end: 0.05 },
-    about: 'Model card plus anti-loop, wrap-up and a repeat penalty on words. Varied and never loops, but overrules the model on ~22% of tokens: common words like "is" get pushed down.' },
-  { id: 'creative', name: 'Creative', s: { temp: 0.8, topp: 0.95, topk: 0, dry: 0.8, rep: 1.1, end: 0.05 },
-    about: 'Hotter and wider: more varied wording, more wrong facts. Overrules the model on ~39% of tokens.' },
-  { id: 'odds', name: 'Model\'s own odds', s: { temp: 1, topp: 1, topk: 0, dry: 0, rep: 1, end: 0 },
-    about: 'Draws straight from the model\'s distribution: every token gets exactly the chance the model gave it. Unfiltered, so ~48% of picks are not its favourite, and it wanders.' },
+  { id: 'greedy', name: 'Greedy', s: { temp: 0, topp: 1, topk: 0, dry: 0, rep: 1 },
+    about: 'Always the model\'s favourite token, nothing changed: the model alone. Deterministic, and long continuations tend to loop.' },
+  { id: 'focused', name: 'Focused', s: { temp: 0, topp: 0.9, topk: 0, dry: 0.8, rep: 1 },
+    about: 'The model\'s favourite, unless anti-loop (DRY) sees a phrase starting to repeat. Deterministic: the same prompt always continues the same way.' },
+  { id: 'card', name: 'Model card', s: { temp: 0.2, topp: 0.9, topk: 0, dry: 0, rep: 1 },
+    about: 'Temperature 0.2, top-p 0.9, no penalties: close to greedy with a little variety. Still loops.' },
+  { id: 'balanced', name: 'Balanced', s: { temp: 0.2, topp: 0.9, topk: 0, dry: 0.8, rep: 1.1 },
+    about: 'Model card plus anti-loop and a repeat penalty on words. Varied and never loops, but the penalty often pushes common words like "is" and "the" down.' },
+  { id: 'creative', name: 'Creative', s: { temp: 0.8, topp: 0.95, topk: 0, dry: 0.8, rep: 1.1 },
+    about: 'Hotter and wider: more varied, more surprising, more often off the rails.' },
+  { id: 'odds', name: 'Model\'s own odds', s: { temp: 1, topp: 1, topk: 0, dry: 0, rep: 1 },
+    about: 'Draws straight from the model\'s distribution: every token gets exactly the chance the model gave it. Unfiltered, so it wanders.' },
 ];
 
 // A preset <select> for the knobs with ids `${prefix}temp`, `${prefix}topp`, ...
-// It shows "Custom" once a slider is moved off every preset.
-function presetPicker(prefix, def) {
+// It shows "Custom" once a slider is moved off every preset, and tells
+// `onMatch` the current preset's name.
+function presetPicker(prefix, def, onMatch = () => {}) {
   const sel = el('select', { id: prefix + 'preset', 'aria-label': 'sampler preset' },
     PRESETS.map((p) => el('option', { value: p.id, text: p.name })),
     el('option', { value: 'custom', text: 'Custom', disabled: '' }));
@@ -242,6 +207,7 @@ function presetPicker(prefix, def) {
     const p = PRESETS.find((p) => knobs().every(([k, r]) => +r.value === p.s[k]));
     sel.value = p ? p.id : 'custom';
     about.textContent = p ? p.about : 'Your own mix. Pick a preset to start over.';
+    onMatch(p ? p.name : 'Custom');
   };
   const apply = (id) => {
     const p = PRESETS.find((p) => p.id === id);
@@ -266,7 +232,6 @@ function setState(st, selMode = 'keep') {
   S.st = st;
   S.cache = {};
   if (selMode === 'last' || S.sel >= st.tokens.length) S.sel = st.tokens.length - 1;
-  S.layer = Math.min(S.layer, st.model.n_layers - 1);
   renderHeader();
   renderTokens();
   renderStatus();
@@ -287,18 +252,9 @@ function renderHeader() {
   }
 }
 
-// Optional per-token weights drawn behind the token strip (attention overlay).
-function tokenOverlay() {
-  if (S.tab !== 'attn') return null;
-  const a = S.cache['attn' + S.layer];
-  return a ? a.heads[S.head][S.sel] : null;
-}
-
 function renderTokens() {
   const box = $('#tokens');
   if (!S.st) { box.replaceChildren(el('span', { class: 'dim', text: 'tokens appear here once the prompt has run' })); return; }
-  const w = tokenOverlay();
-  const max = w ? Math.max(...w) : 1;
   // Tokens that weren't in the strip last time pop in, one after another.
   const ids = S.st.tokens.map((t) => t.id), prev = S.shownIds || [];
   let same = 0;
@@ -310,14 +266,12 @@ function renderTokens() {
       text: vis(t.text),
     });
     if (i >= same) c.style.animationDelay = Math.min(i - same, 40) * 18 + 'ms';
-    if (w && i < w.length) c.style.setProperty('--w', (w[i] / max) ** 0.6);
     c.onclick = () => { S.sel = i; renderTokens(); renderTab(); };
     c.ondblclick = () => act(async () => setState(await call('rewind', { len: i + 1 }), 'last'));
     c.onmousemove = (e) => showTip(e,
       el('b', { text: `position ${i} · token id ${t.id}` }),
       el('div', { class: 'mono', text: JSON.stringify(t.text) }),
       el('div', { class: 'dim', text: (t.special ? 'special token · ' : '') + (t.gen ? 'generated' : 'prompt') }),
-      w && i < w.length ? el('div', { text: `attention from selected token: ${pct(w[i])}` }) : null,
       el('div', { class: 'dim', text: 'click: select · double-click: rewind generation to here' }));
     c.onmouseleave = hideTip;
     return c;
@@ -348,28 +302,15 @@ function renderStatus() {
 
 const TABS = [
   ['next', 'Next token', viewNext],
-  ['flow', 'Flow', viewFlow],
   ['walk', 'Step by step', viewWalk],
-  ['lens', 'Logit lens', viewLens],
-  ['attn', 'Attention', viewAttn],
-  ['kv', 'KV cache', viewKV],
-  ['resid', 'Residual stream', viewResid],
 ];
-
-// Only these tabs are shown for now. The others stay in the code, hidden: add
-// an id here to bring one back. Links to a hidden tab (About dialog, glossary)
-// go to Step by step, which covers the same ground one operation at a time.
-const SHOWN_TABS = ['next', 'walk'];
-const shownTab = (id) => (SHOWN_TABS.includes(id) ? id : 'walk');
-const tabName = (id) => TABS.find((t) => t[0] === id)[1];
+// A tab id from elsewhere (glossary, an old cached glossary.js, a URL) may
+// name a tab that no longer exists: those go to Step by step.
+const tabOf = (id) => (TABS.some((t) => t[0] === id) ? id : 'walk');
+const tabName = (id) => TABS.find((t) => t[0] === tabOf(id))[1];
 
 const TAB_ICONS = {
-  flow: 'M3 14V2M3 10c4 0 6-6 10-6M3 10c4 0 6 2 10 2',
   walk: 'M2 13.5h3v-3h3v-3h3v-3h3',
-  lens: 'M2 3h12M2 6.5h12M2 10h12M2 13.5h7',
-  attn: 'M3 13 8 3l5 10M5 9h6',
-  resid: 'M2 12c2-6 4-6 6-3s4 3 6-4',
-  kv: 'M3 3h10v4H3zM3 9h10v4H3z',
   next: 'M3 13V9M6.5 13V5M10 13V7M13.5 13V3',
 };
 
@@ -378,7 +319,7 @@ const TAB_ICONS = {
 function renderTabs() {
   const bar = $('#tabs');
   if (!bar.childElementCount) {
-    bar.append(...TABS.filter(([id]) => SHOWN_TABS.includes(id)).map(([id, name]) => el('button', {
+    bar.append(...TABS.map(([id, name]) => el('button', {
       'data-tab': id,
       onclick: () => {
         if (S.tab === id) return;
@@ -410,18 +351,16 @@ function moveInk(bar) {
   ink.style.width = b.offsetWidth + 'px';
   ink.style.transform = `translateX(${b.offsetLeft}px)`;
 }
-addEventListener('resize', () => document.querySelectorAll('#tabs, #modes').forEach(moveInk));
+addEventListener('resize', () => moveInk($('#tabs')));
 
 async function renderTab() {
   const gen = ++S.renderGen;
   const panel = $('#panel');
   if (!S.st) { panel.replaceChildren(viewNoModel()); return; }
   const view = TABS.find((t) => t[0] === S.tab)[2];
-  // Slow views (the logit lens on a long prompt) get a note instead of a frozen page.
+  // A slow view gets a note instead of a frozen page.
   const slow = setTimeout(() => {
-    if (gen === S.renderGen) panel.replaceChildren(el('p', { class: 'explain', text: S.tab === 'lens'
-      ? `computing the logit lens: ${S.st.tokens.length} positions × ${S.st.model.n_layers + 1} layers, each projected onto all ${S.st.model.vocab.toLocaleString()} vocabulary tokens…`
-      : 'computing…' }));
+    if (gen === S.renderGen) panel.replaceChildren(el('p', { class: 'explain', text: 'computing…' }));
   }, 250);
   try {
     const nodes = await view();
@@ -437,7 +376,6 @@ async function renderTab() {
       clearTimeout(S.enterT);
       S.enterT = setTimeout(() => panel.classList.remove('enter'), 900);
     }
-    if (S.tab === 'attn') renderTokens(); // overlay depends on fetched data
   } catch (e) {
     clearTimeout(slow);
     if (gen === S.renderGen) panel.replaceChildren(el('p', { class: 'explain', text: 'Error: ' + e.message }));
@@ -446,487 +384,6 @@ async function renderTab() {
 
 const explain = (...parts) => el('p', { class: 'explain' }, ...parts);
 const B = (t) => el('b', { text: t });
-
-// ---------------------------------------------------------------- logit lens
-
-const LENS_COLOR = {
-  answer: ['final answer', 'probability each layer gives to the token the model finally outputs here'],
-  next: ['actual next', 'probability of the token that actually came next (blank: not generated yet)'],
-  conf: ['confidence', 'probability of the layer\'s own top guess'],
-};
-
-// For column p: the lowest stage from which every layer's top guess equals the final answer.
-function lockIn(L, p) {
-  const ans = L.answers[p][0];
-  let i = L.stages.length - 1;
-  while (i > 0 && L.cells[i - 1][p].top[0][0] === ans) i--;
-  return i;
-}
-
-// Run-length encode the top guess up the layers: [{text, id, from, to}].
-function story(L, p) {
-  const out = [];
-  L.cells.forEach((row, si) => {
-    const [id, text] = row[p].top[0];
-    const last = out[out.length - 1];
-    if (last && last.id === id) last.to = si;
-    else out.push({ id, text, from: si, to: si });
-  });
-  return out;
-}
-
-function lensValue(c) {
-  if (S.lensColor === 'answer') return c.f ? c.f[0] : null;
-  if (S.lensColor === 'next') return c.t ? c.t[0] : null;
-  return c.top[0][2];
-}
-
-function lensTip(e, L, si, p) {
-  const c = L.cells[si][p], toks = S.st.tokens, n = toks.length;
-  const ans = L.answers[p];
-  showTip(e,
-    el('b', { text: `${L.stages[si]} · position ${p}, after ${JSON.stringify(toks[p].text)}` }),
-    el('div', { class: 'bars', style: 'margin:6px 0' },
-      c.top.map(([tid, tt, pr]) => [
-        el('span', { class: 'mono', style: tid === ans[0] ? 'color:var(--accent)' : '', text: clip(vis(tt), 16) }),
-        el('div', { class: 'bar', style: `width:${Math.max(1, pr * 160)}px` }),
-        el('span', { text: pct(pr) })])),
-    el('div', { text: `final answer ${JSON.stringify(ans[1])}: ${pct(c.f[0])}, rank ${c.f[1] + 1}` }),
-    p + 1 < n
-      ? el('div', { text: `actual next ${JSON.stringify(toks[p + 1].text)}: ${pct(c.t[0])}, rank ${c.t[1] + 1}` })
-      : el('div', { class: 'dim', text: 'next token not generated yet' }),
-    el('div', { class: 'dim', text: `entropy ${c.h.toFixed(2)} bits (0 = certain, 15.6 = uniform)` }));
-}
-
-function lensGrid(L) {
-  const toks = S.st.tokens, n = toks.length, ns = L.stages.length;
-  const locks = toks.map((_, p) => lockIn(L, p));
-  const shown = [];
-  for (let si = ns - 1; si >= 0; si--) if (si === 0 || si === ns - 1 || si % S.lensStride === 0) shown.push(si);
-
-  const head = [
-    el('tr', {}, el('th', { text: 'input →' }),
-      toks.map((t, p) => el('th', { class: p === S.sel ? 'sel' : '', title: `position ${p}`, text: clip(vis(t.text), 9) }))),
-    el('tr', { class: 'nextrow' }, el('th', { text: 'actual next →' }),
-      toks.map((t, p) => el('th', { class: p === S.sel ? 'sel' : '', text: p + 1 < n ? clip(vis(toks[p + 1].text), 9) : '?' }))),
-  ];
-
-  const rows = shown.map((si) => {
-    const final = si === ns - 1;
-    return el('tr', { class: final ? 'final' : '' },
-      el('th', { text: final ? L.stages[si] + ' (output)' : L.stages[si] }),
-      L.cells[si].map((c, p) => {
-        const [id, text, prob] = c.top[0];
-        const agree = id === L.answers[p][0];
-        const v = lensValue(c);
-        const td = el('td', {
-          class: [agree ? 'agree' : '', si === locks[p] && si > 0 ? 'lock' : '', p === S.sel ? 'selcol' : ''].join(' '),
-          style: v == null
-            ? 'background:#20242c;color:#8a93a3'
-            : `background:${heat(v)};color:${heatText(v)}`,
-          text: clip(vis(text), 8),
-        });
-        // Unsure guesses fade out, so the eye goes to what the layer actually believes.
-        if (!agree) td.style.opacity = (0.35 + 0.65 * Math.sqrt(prob)).toFixed(2);
-        td.onmousemove = (e) => lensTip(e, L, si, p);
-        td.onmouseleave = hideTip;
-        td.onclick = () => { S.sel = p; renderTokens(); renderTab(); };
-        return td;
-      }));
-  });
-
-  const wrap = el('div', { class: 'scroll', style: 'max-height:78vh' },
-    el('table', { class: 'lens' }, el('thead', {}, head), el('tbody', {}, rows)));
-  requestAnimationFrame(() => {
-    const th = wrap.querySelector('thead th.sel');
-    if (th) wrap.scrollLeft = Math.max(0, th.offsetLeft - wrap.clientWidth / 2);
-  });
-  return wrap;
-}
-
-// Probability of the final answer / actual next / top guess across all stages, log scale.
-function lensChart(L, p) {
-  const ns = L.stages.length, toks = S.st.tokens;
-  const W = 940, H = 210, ml = 48, mr = 12, mt = 10, mb = 26;
-  const cv = el('canvas');
-  const g = hiDPI(cv, W, H);
-  const x = (si) => ml + (si / Math.max(1, ns - 1)) * (W - ml - mr);
-  const LO = -5; // 1e-5
-  const y = (pr) => mt + (1 - (Math.max(LO, Math.log10(Math.max(pr, 1e-12))) - LO) / -LO) * (H - mt - mb);
-  g.font = '10px ui-monospace, Menlo, monospace';
-  g.textBaseline = 'middle';
-  g.textAlign = 'right';
-  for (let e = 0; e >= LO; e--) {
-    g.strokeStyle = '#2a303b';
-    g.beginPath(); g.moveTo(ml, y(10 ** e)); g.lineTo(W - mr, y(10 ** e)); g.stroke();
-    g.fillStyle = '#8a93a3';
-    g.fillText(['100%', '10%', '1%', '0.1%', '0.01%', '≤0.001%'][-e], ml - 6, y(10 ** e));
-  }
-  g.textAlign = 'center';
-  L.stages.forEach((lab, si) => {
-    if (si === 0 || si === ns - 1 || (ns > 40 ? si % 8 === 0 : si % 4 === 0)) g.fillText(lab, x(si), H - 10);
-  });
-  const lock = lockIn(L, p);
-  if (lock > 0) {
-    g.fillStyle = 'rgba(240,160,80,.10)';
-    g.fillRect(x(lock), mt, W - mr - x(lock), H - mt - mb);
-  }
-  const series = [
-    ['#8a93a3', 1, [3, 3], (c) => c.top[0][2]],
-    ['#f0a050', 2.5, [], (c) => c.f[0]],
-  ];
-  if (p + 1 < toks.length && L.answers[p][0] !== toks[p + 1].id) series.push(['#5fb3f0', 2, [], (c) => c.t[0]]);
-  for (const [color, w, dash, f] of series) {
-    g.strokeStyle = color; g.lineWidth = w; g.setLineDash(dash);
-    g.beginPath();
-    L.cells.forEach((row, si) => (si ? g.lineTo(x(si), y(f(row[p]))) : g.moveTo(x(si), y(f(row[p])))));
-    g.stroke();
-  }
-  g.setLineDash([]);
-  cv.onmousemove = (e) => {
-    const si = Math.round(((e.clientX - cv.getBoundingClientRect().left - ml) / (W - ml - mr)) * (ns - 1));
-    if (si < 0 || si >= ns) return hideTip();
-    lensTip(e, L, si, p);
-  };
-  cv.onmouseleave = hideTip;
-  return cv;
-}
-
-function lensDetail(L) {
-  const p = S.sel, toks = S.st.tokens, n = toks.length;
-  const [ansId, ansText] = L.answers[p];
-  const finalProb = L.cells[L.stages.length - 1][p].top[0][2];
-  const lock = lockIn(L, p);
-  const nextKnown = p + 1 < n;
-  const correct = nextKnown && toks[p + 1].id === ansId;
-
-  const segs = story(L, p);
-  const storyEls = [];
-  segs.forEach((sg, i) => {
-    if (i) storyEls.push(el('span', { class: 'dim', text: ' → ' }));
-    const range = sg.from === sg.to ? L.stages[sg.from] : `${L.stages[sg.from]}–${L.stages[sg.to]}`;
-    storyEls.push(el('span', { class: 'seg' + (sg.id === ansId ? ' ans' : '') },
-      el('span', { class: 'dim', text: range + ' ' }), el('b', { class: 'mono', text: vis(sg.text) })));
-  });
-
-  return el('div', { class: 'lensdetail' },
-    el('h3', { text: `position ${p}: what comes after ${JSON.stringify(toks[p].text)}?` }),
-    el('p', {},
-      'The model\'s answer is ', el('b', { class: 'mono', style: 'color:var(--accent)', text: JSON.stringify(ansText) }), ` (${pct(finalProb)}). `,
-      nextKnown
-        ? [correct ? el('span', { style: 'color:var(--good)', text: 'That is what came next. ' })
-            : ['The actual next token was ', el('b', { class: 'mono', style: 'color:var(--accent2)', text: JSON.stringify(toks[p + 1].text) }), '. ']]
-        : 'Nothing has been generated after it yet. ',
-      lock > 0
-        ? ['It ', el('b', { text: `locks in at ${L.stages[lock]}` }), ': from there up, every layer\'s top guess is the final answer.']
-        : 'Even the raw embedding already points at it.'),
-    el('div', { class: 'story' }, el('span', { class: 'dim', text: 'top guess, bottom to top: ' }), storyEls),
-    el('div', { class: 'legend', style: 'margin:10px 0 4px' },
-      el('span', { style: 'color:#f0a050', text: '━ final answer' }),
-      nextKnown && !correct ? el('span', { style: 'color:#5fb3f0', text: '━ actual next' }) : null,
-      el('span', { text: '┅ that layer\'s top guess' }),
-      el('span', { style: 'color:#f0a050', text: '▒ locked in' })),
-    el('div', { class: 'scroll' }, lensChart(L, p)));
-}
-
-async function viewLens() {
-  const L = await cached('lens' + S.mid, 'lens', { mid: S.mid });
-  const pick = (label, cur, opts, set) => el('span', { class: 'pick' }, label + ' ', ...opts.map(([v, t, title]) =>
-    el('button', { class: cur === v ? 'on' : '', text: t, title, onclick: () => { set(v); renderTab(); } })));
-  const midBox = el('input', { type: 'checkbox' });
-  midBox.checked = S.mid;
-  midBox.onchange = () => { S.mid = midBox.checked; renderTab(); };
-
-  return [
-    explain('The ', B('residual stream'), ' is a running sum that every layer adds to. The logit lens reads it ', B('after every layer'),
-      ' as if that layer were the last (final RMSNorm, then the unembedding) and shows the top guess for the ', B('next'),
-      ' token. Each column is one position; read it bottom to top to watch the guess form. ',
-      B('Bold'), ' = already agrees with the final answer; faded = an unsure guess; an ', el('span', { style: 'color:var(--accent)', text: 'orange edge' }),
-      ' marks the layer where the answer locks in for good. Click a column for its story.'),
-    el('div', { class: 'controls' },
-      pick('colour by', S.lensColor, Object.entries(LENS_COLOR).map(([k, [t, title]]) => [k, t, title]), (v) => (S.lensColor = v)),
-      pick('rows', S.lensStride, [[1, 'all'], [2, 'every 2nd'], [4, 'every 4th']], (v) => (S.lensStride = v)),
-      el('label', { title: 'insert a row after each attention block, before the MLP' }, midBox, 'half-layers'),
-      legend(LENS_COLOR[S.lensColor][0] + ' probability', heat, '0', '1')),
-    lensGrid(L),
-    lensDetail(L),
-  ];
-}
-
-// ---------------------------------------------------------------- attention
-
-function drawAttnThumb(canvas, rows) {
-  const n = rows.length;
-  canvas.width = n; canvas.height = n;
-  const g = canvas.getContext('2d');
-  const img = g.createImageData(n, n);
-  for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) {
-      const o = (i * n + j) * 4;
-      const [r, gg, b] = j <= i ? heatRGB(Math.sqrt(rows[i][j])) : [10, 12, 15];
-      img.data[o] = r; img.data[o + 1] = gg; img.data[o + 2] = b; img.data[o + 3] = 255;
-    }
-  }
-  g.putImageData(img, 0, 0);
-}
-
-function drawAttnBig(rows, toks) {
-  const n = rows.length;
-  const cell = Math.max(3, Math.min(22, Math.floor(620 / n)));
-  const labels = cell >= 9;
-  const m = labels ? 92 : 4;
-  const W = m + n * cell + 4, H = m + n * cell + 4;
-  const canvas = el('canvas');
-  const g = hiDPI(canvas, W, H);
-  g.fillStyle = '#0a0c0f';
-  g.fillRect(m, m, n * cell, n * cell);
-  for (let i = 0; i < n; i++)
-    for (let j = 0; j <= i; j++) {
-      g.fillStyle = heat(Math.sqrt(rows[i][j]));
-      g.fillRect(m + j * cell, m + i * cell, cell - (cell > 5 ? 1 : 0), cell - (cell > 5 ? 1 : 0));
-    }
-  // selected query row
-  g.strokeStyle = '#fff'; g.lineWidth = 1.5;
-  g.strokeRect(m - 1, m + S.sel * cell - 1, n * cell + 2, cell + 2);
-  if (labels) {
-    g.font = `${Math.min(12, cell)}px ui-monospace, Menlo, monospace`;
-    g.fillStyle = '#8a93a3'; g.textBaseline = 'middle';
-    for (let i = 0; i < n; i++) {
-      const t = clip(vis(toks[i].text), 11);
-      g.textAlign = 'right';
-      g.fillText(t, m - 4, m + i * cell + cell / 2);
-      g.save();
-      g.translate(m + i * cell + cell / 2, m - 4);
-      g.rotate(-Math.PI / 2);
-      g.textAlign = 'left';
-      g.fillText(t, 0, 0);
-      g.restore();
-    }
-  }
-  canvas.onmousemove = (e) => {
-    const r = canvas.getBoundingClientRect();
-    const j = Math.floor((e.clientX - r.left - m) / cell), i = Math.floor((e.clientY - r.top - m) / cell);
-    if (i < 0 || j < 0 || i >= n || j >= n) return hideTip();
-    if (j > i) return showTip(e, el('div', { class: 'dim', text: `position ${i} cannot see position ${j}: it is in the future (causal mask)` }));
-    showTip(e, el('b', { text: `query ${i} ${JSON.stringify(toks[i].text)} → key ${j} ${JSON.stringify(toks[j].text)}` }),
-      el('div', { text: `attention weight ${pct(rows[i][j])}` }));
-  };
-  canvas.onmouseleave = hideTip;
-  canvas.onclick = (e) => {
-    const r = canvas.getBoundingClientRect();
-    const i = Math.floor((e.clientY - r.top - m) / cell);
-    if (i >= 0 && i < n) { S.sel = i; renderTokens(); renderTab(); }
-  };
-  return canvas;
-}
-
-async function viewAttn() {
-  const m = S.st.model, toks = S.st.tokens;
-  const A = await cached('attn' + S.layer, 'attn', { layer: S.layer });
-  const group = m.n_heads / m.n_kv_heads;
-  const ablated = new Set(S.st.ablate.map(([l, h]) => l + ':' + h));
-
-  const setAblation = (h, on) => act(async () => {
-    const set = new Set(ablated);
-    on ? set.add(S.layer + ':' + h) : set.delete(S.layer + ':' + h);
-    setState(await call('ablate', { heads: [...set].map((k) => k.split(':').map(Number)) }));
-  });
-
-  const groups = [];
-  for (let g = 0; g < m.n_kv_heads; g++) {
-    const heads = [];
-    for (let h = g * group; h < (g + 1) * group; h++) {
-      const c = el('canvas');
-      drawAttnThumb(c, A.heads[h]);
-      const box = el('input', { type: 'checkbox' });
-      box.checked = ablated.has(S.layer + ':' + h);
-      box.onclick = (e) => e.stopPropagation();
-      box.onchange = () => setAblation(h, box.checked);
-      heads.push(el('div', {
-        class: 'head' + (h === S.head ? ' sel' : '') + (box.checked ? ' ablated' : ''),
-        onclick: () => { S.head = h; renderTokens(); renderTab(); },
-      }, c, el('span', { text: `head ${h}` }), el('label', { title: 'zero this head\'s output and re-run' }, box, 'ablate')));
-    }
-    groups.push(el('div', { class: 'group' }, el('div', { class: 'dim', text: `KV head ${g}: these ${group} query heads share one K and one V` }), el('div', { class: 'heads' }, heads)));
-  }
-
-  const hn = A.head_norm[S.sel] || [];
-  const hmax = Math.max(...hn, 1e-6);
-  const normBars = el('div', { class: 'bars' }, hn.map((v, h) => [
-    el('span', { text: `head ${h}` }), el('div', { class: 'bar' + (h === S.head ? ' alt' : ''), style: `width:${(v / hmax) * 300}px` }), el('span', { text: v.toFixed(2) })]));
-
-  return [
-    explain('Each head turns every token into a ', B('query'), ' ("what am I looking for?") and a ', B('key'), ' ("what do I contain?"). ',
-      'Row i of a map is how token i spreads its attention over tokens 0…i, from softmax(q·k / √d). Everything above the diagonal is the causal mask: no peeking ahead. ',
-      'Grouped-query attention: query heads come in groups that share one key/value head, which shrinks the KV cache ', String(group), '×. ',
-      'Many heads park most of their attention on position 0, an "attention sink" used as a no-op. ',
-      'The token strip above is shaded by where the selected token looks in the selected head. Colour is √weight so that small weights stay visible.'),
-    el('div', { class: 'controls' },
-      slider('layer', S.layer, m.n_layers - 1, (v) => { S.layer = v; renderTab(); }),
-      S.st.ablate.length ? el('span', { class: 'dim', text: `ablated: ${S.st.ablate.map(([l, h]) => `L${l}H${h}`).join(', ')}` }) : null,
-      S.st.ablate.length ? el('button', { text: 'clear ablations', onclick: () => act(async () => setState(await call('ablate', { heads: [] }))) }) : null),
-    el('div', { class: 'groups' }, groups),
-    el('h3', { text: `layer ${S.layer} · head ${S.head} (KV head ${Math.floor(S.head / group)})` }),
-    el('div', { class: 'scroll' }, drawAttnBig(A.heads[S.head], toks)),
-    el('h3', { text: `how much each head writes at position ${S.sel} (‖head output‖, before o_proj)` }),
-    normBars,
-  ];
-}
-
-// ---------------------------------------------------------------- residual stream
-
-async function viewResid() {
-  const st = S.st, m = st.model, toks = st.tokens, n = toks.length;
-  const R = st.resid_norm; // [stage][pos]
-  // Heatmap of ‖x‖ at the output of each layer, log scale.
-  const stages = [0, ...Array.from({ length: m.n_layers }, (_, l) => 2 * l + 2)];
-  const vals = stages.flatMap((s) => R[s]);
-  const lo = Math.log(Math.min(...vals) + 1e-6), hi = Math.log(Math.max(...vals) + 1e-6);
-  const cw = Math.max(4, Math.min(24, Math.floor(900 / n))), ch = 12, ml = 56;
-  const hm = el('canvas');
-  const g = hiDPI(hm, ml + n * cw, stages.length * ch + 4);
-  g.font = '10px ui-monospace, Menlo, monospace'; g.textBaseline = 'middle'; g.textAlign = 'right';
-  stages.forEach((s, si) => {
-    const y = (stages.length - 1 - si) * ch;
-    g.fillStyle = '#8a93a3';
-    if (si % 2 === 0 || si === stages.length - 1) g.fillText(si === 0 ? 'embed' : 'L' + (si - 1), ml - 6, y + ch / 2);
-    for (let p = 0; p < n; p++) {
-      g.fillStyle = heat((Math.log(R[s][p] + 1e-6) - lo) / (hi - lo || 1));
-      g.fillRect(ml + p * cw, y, cw - 1, ch - 1);
-    }
-  });
-  g.strokeStyle = '#fff'; g.strokeRect(ml + S.sel * cw - 0.5, 0, cw, stages.length * ch);
-  hm.onmousemove = (e) => {
-    const r = hm.getBoundingClientRect();
-    const p = Math.floor((e.clientX - r.left - ml) / cw), si = stages.length - 1 - Math.floor((e.clientY - r.top) / ch);
-    if (p < 0 || p >= n || si < 0 || si >= stages.length) return hideTip();
-    showTip(e, el('b', { text: `${si === 0 ? 'embedding' : 'after layer ' + (si - 1)} · position ${p} ${JSON.stringify(toks[p].text)}` }),
-      el('div', { text: `‖x‖ = ${R[stages[si]][p].toFixed(2)}` }));
-  };
-  hm.onmouseleave = hideTip;
-  hm.onclick = (e) => {
-    const p = Math.floor((e.clientX - hm.getBoundingClientRect().left - ml) / cw);
-    if (p >= 0 && p < n) { S.sel = p; renderTokens(); renderTab(); }
-  };
-
-  // Per-layer writes for the selected position.
-  const p = S.sel;
-  const aw = st.attn_write.map((v) => v[p]), mw = st.mlp_write.map((v) => v[p]);
-  const rn = stages.map((s) => R[s][p]);
-  const W = 900, H = 230, pad = 34, bw = (W - pad * 2) / m.n_layers;
-  const ch2 = el('canvas');
-  const g2 = hiDPI(ch2, W, H);
-  const ymax = Math.max(...aw, ...mw, 1e-6), rmax = Math.max(...rn, 1e-6);
-  g2.fillStyle = '#8a93a3'; g2.font = '10px ui-monospace, Menlo, monospace'; g2.textAlign = 'center';
-  for (let l = 0; l < m.n_layers; l++) {
-    const x = pad + l * bw;
-    const ha = (aw[l] / ymax) * (H - 50), hmv = (mw[l] / ymax) * (H - 50);
-    g2.fillStyle = '#5fb3f0'; g2.fillRect(x + 2, H - 20 - ha, bw / 2 - 3, ha);
-    g2.fillStyle = '#f0a050'; g2.fillRect(x + bw / 2, H - 20 - hmv, bw / 2 - 3, hmv);
-    g2.fillStyle = '#8a93a3'; if (l % 2 === 0) g2.fillText(String(l), x + bw / 2, H - 6);
-  }
-  g2.strokeStyle = '#d8dee9'; g2.lineWidth = 1.5; g2.beginPath();
-  rn.forEach((v, i) => {
-    const x = pad + (i - 0.5) * bw + bw / 2, y = H - 20 - (v / rmax) * (H - 50);
-    i ? g2.lineTo(Math.max(pad, x), y) : g2.moveTo(pad, y);
-  });
-  g2.stroke();
-  ch2.onmousemove = (e) => {
-    const l = Math.floor((e.clientX - ch2.getBoundingClientRect().left - pad) / bw);
-    if (l < 0 || l >= m.n_layers) return hideTip();
-    showTip(e, el('b', { text: `layer ${l} at position ${p}` }),
-      el('div', { text: `attention adds ‖Δ‖ = ${aw[l].toFixed(2)}` }),
-      el('div', { text: `MLP adds ‖Δ‖ = ${mw[l].toFixed(2)}` }),
-      el('div', { text: `‖x‖ after the layer = ${rn[l + 1].toFixed(2)}` }));
-  };
-  ch2.onmouseleave = hideTip;
-
-  return [
-    explain('The residual stream is the model\'s working memory: one ', String(m.hidden), '-dim vector per token. No layer ever overwrites it; each one ',
-      B('adds'), ' a correction (x ← x + attn(norm(x)), then x ← x + mlp(norm(x))). RMSNorm before each sublayer means the layers see the direction, ',
-      'not the size. That lets the stream grow freely, and some positions, often the first token, develop huge norms: those are the "massive activations" that attention sinks rely on.'),
-    el('h3', { text: '‖residual‖ at each layer × position (log colour scale) · click a column to select' }),
-    el('div', { class: 'scroll' }, hm),
-    el('h3', { text: `what each layer writes at position ${p} ${JSON.stringify(toks[p].text)}` }),
-    el('div', { class: 'legend' }, el('span', { style: 'color:#5fb3f0', text: '■ attention ‖Δ‖' }), el('span', { style: 'color:#f0a050', text: '■ MLP ‖Δ‖' }), el('span', { text: '— ‖x‖ (own scale)' })),
-    el('div', { class: 'scroll' }, ch2),
-  ];
-}
-
-// ---------------------------------------------------------------- KV cache
-
-async function viewKV() {
-  const st = S.st, m = st.model, c = st.cache, toks = st.tokens, op = st.last_op;
-  const KV = await cached('kv' + S.layer, 'kv', { layer: S.layer });
-  const group = m.n_heads / m.n_kv_heads;
-  const full = c.bytes_per_token * group;
-
-  // Occupancy: layers × positions.
-  const shown = Math.min(c.max_seq, Math.max(c.len + 24, 64));
-  const cw = Math.max(2, Math.min(14, Math.floor(900 / shown))), chh = 6;
-  const occ = el('canvas');
-  const g = hiDPI(occ, shown * cw, m.n_layers * chh);
-  const lo = op.pos0, hi = op.pos0 + op.n;
-  for (let l = 0; l < m.n_layers; l++)
-    for (let p = 0; p < shown; p++) {
-      g.fillStyle = p >= c.len ? '#1d222b' : p >= lo && p < hi ? '#f0a050' : '#3d6690';
-      g.fillRect(p * cw, l * chh, cw - 1, chh - 1);
-    }
-
-  // K or V of one KV head: positions × head_dim.
-  const rows = KV[S.kvWhich];
-  const off = S.kvHead * m.head_dim;
-  let amax = 1e-6;
-  for (const r of rows) for (let d = 0; d < m.head_dim; d++) amax = Math.max(amax, Math.abs(r[off + d]));
-  const cell = Math.max(3, Math.min(12, Math.floor(560 / rows.length))), dc = 9, ml = 70;
-  const hmc = el('canvas');
-  const g2 = hiDPI(hmc, ml + m.head_dim * dc, rows.length * cell + 16);
-  g2.font = '10px ui-monospace, Menlo, monospace'; g2.textBaseline = 'middle'; g2.textAlign = 'right';
-  rows.forEach((r, p) => {
-    if (cell >= 9) { g2.fillStyle = p >= lo && p < hi ? '#f0a050' : '#8a93a3'; g2.fillText(clip(vis(toks[p].text), 9), ml - 4, p * cell + cell / 2); }
-    for (let d = 0; d < m.head_dim; d++) {
-      g2.fillStyle = `rgb(${divRGB(r[off + d] / amax).join(',')})`;
-      g2.fillRect(ml + d * dc, p * cell, dc - 1, cell - (cell > 4 ? 1 : 0));
-    }
-  });
-  g2.fillStyle = '#8a93a3'; g2.textAlign = 'center';
-  for (let d = 0; d < m.head_dim; d += 8) g2.fillText(String(d), ml + d * dc + dc / 2, rows.length * cell + 8);
-  hmc.onmousemove = (e) => {
-    const r = hmc.getBoundingClientRect();
-    const d = Math.floor((e.clientX - r.left - ml) / dc), p = Math.floor((e.clientY - r.top) / cell);
-    if (d < 0 || d >= m.head_dim || p < 0 || p >= rows.length) return hideTip();
-    const half = m.head_dim / 2, i = d % half;
-    showTip(e, el('b', { text: `${S.kvWhich.toUpperCase()}[pos ${p} ${JSON.stringify(toks[p].text)}][dim ${d}] = ${rows[p][off + d].toFixed(3)}` }),
-      S.kvWhich === 'k' ? el('div', { class: 'dim', text: `RoPE pair (${i}, ${i + half}): rotates ${(1 / Math.pow(m.rope_theta, (2 * i) / m.head_dim)).toPrecision(3)} rad per position` }) : null);
-  };
-  hmc.onmouseleave = hideTip;
-
-  const pick = (label, cur, opts, set) => el('span', {}, label + ' ', ...opts.map(([v, t]) =>
-    el('button', { class: cur === v ? 'on' : '', text: t, onclick: () => { set(v); renderTab(); } })));
-
-  return [
-    explain('During decoding, each new token needs the keys and values of every earlier token, in every layer. Those never change, so they are computed once and ',
-      B('cached'), '. A decode step then runs the model on just 1 token, appends 1 row of K and V per layer, and attends over the cache. ',
-      'Prefill writes a whole block at once; each decode step writes one column (orange = written by the last operation). ',
-      'Recomputing instead would make generating n tokens cost O(n²) forward work.'),
-    el('div', { class: 'kpi' },
-      el('div', {}, el('b', { text: fmtBytes(c.bytes) }), `in use (${c.len} positions)`),
-      el('div', {}, el('b', { text: fmtBytes(c.bytes_per_token) }), `per token = ${m.n_layers} layers × 2 (K,V) × ${c.kv_dim} floats × 4 B`),
-      el('div', {}, el('b', { text: fmtBytes(full) }), `per token without GQA (${m.n_heads} KV heads instead of ${m.n_kv_heads})`),
-      el('div', {}, el('b', { text: fmtBytes(c.bytes_per_token * 8192) }), 'at the model\'s full 8192-token context')),
-    el('h3', { text: `occupancy: ${m.n_layers} layers (rows) × positions (columns)` }),
-    el('div', { class: 'scroll' }, occ),
-    el('div', { class: 'controls', style: 'margin-top:14px' },
-      slider('layer', S.layer, m.n_layers - 1, (v) => { S.layer = v; renderTab(); }),
-      pick('show', S.kvWhich, [['k', 'K (keys, after RoPE)'], ['v', 'V (values)']], (v) => (S.kvWhich = v)),
-      pick('KV head', S.kvHead, Array.from({ length: m.n_kv_heads }, (_, i) => [i, String(i)]), (v) => (S.kvHead = v))),
-    explain(S.kvWhich === 'k'
-      ? `Keys are stored after RoPE. Dimension i and i+${m.head_dim / 2} form a pair rotated by an angle proportional to the position; pair 0 turns fastest (1 rad per token), and the last pairs barely move. Hover a column to see its rotation speed. Fast pairs encode fine-grained relative position; slow pairs act almost like position-free channels.`
-      : 'Values are what gets mixed together, weighted by attention. They carry no positional rotation.'),
-    el('div', { class: 'scroll' }, hmc),
-    legend('', (v) => `rgb(${divRGB(v * 2 - 1).join(',')})`, '−' + amax.toFixed(2), '+' + amax.toFixed(2)),
-  ];
-}
 
 // ---------------------------------------------------------------- next token
 
@@ -984,7 +441,7 @@ async function viewNext() {
     explain('The final layer produces one logit per vocabulary entry; softmax turns them into the ', B('model\'s distribution'), ' (blue). ',
       'Sampling settings then reshape it (orange): temperature divides the logits, top-k and top-p cut the tail, the repetition penalty pushes down recently used tokens, and ',
       B('DRY'), ' (↺) pushes down a token that would continue a sequence the text already contains, harder the longer the repeat: the loop-breaker a model this small badly needs. ',
-      'Change the settings above and watch the orange bars move. Click a token to force it as the next token: an intervention on the sampler, not the model.'),
+      'Change them in the Sampler menu above and watch the orange bars move. Click a token to force it as the next token: an intervention on the sampler, not the model.'),
     el('div', { class: 'kpi' },
       el('div', {}, el('b', { text: JSON.stringify(toks[toks.length - 1].text) }), `last token (position ${toks.length - 1})`),
       el('div', {}, el('b', { text: pct(covered) }), 'of probability mass in the top 50 shown'),
@@ -1086,7 +543,7 @@ function ensureModel({ ask = true } = {}) {
   })());
 }
 
-// The engine starts on its own default prompt and chat; bring it in line with
+// The engine starts on its own default prompt; bring it in line with
 // whatever the visitor typed before it was loaded.
 async function onModelReady() {
   READY = true;
@@ -1096,10 +553,6 @@ async function onModelReady() {
   const text = $('#prompt').value;
   if (text && text !== st.tokens.map((t) => t.text).join('')) st = await call('run', { text });
   setState(st, 'last');
-  C.st = await call('chat_state');
-  if (!$('#c-system').value.trim()) $('#c-system').value = C.st.system;
-  else if ($('#c-system').value !== C.st.system) C.st = await call('chat_reset', { system: $('#c-system').value });
-  renderChatSide();
 }
 
 // Before the model is loaded, the header offers the download instead of stats.
@@ -1107,7 +560,7 @@ function renderModelChip() {
   const box = $('#model-info');
   if (READY) { if (box.querySelector('.getmodel')) box.replaceChildren(); return; }
   box.replaceChildren(el('button', {
-    class: 'getmodel', title: MODEL_INFO.cached ? 'load SmolLM2-135M-Instruct from the browser cache' : `download SmolLM2-135M-Instruct (${mb(MODEL_INFO.bytes)}) and run it in this tab`,
+    class: 'getmodel', title: MODEL_INFO.cached ? 'load SmolLM2-135M from the browser cache' : `download SmolLM2-135M (${mb(MODEL_INFO.bytes)}) and run it in this tab`,
     onclick: () => ensureModel(),
   }, svgIcon('M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10'), MODEL_INFO.cached ? 'Load model' : `Get the model · ${mb(MODEL_INFO.bytes)}`));
 }
@@ -1119,14 +572,14 @@ function viewNoModel() {
     el('div', { class: 'empty-orb', 'aria-hidden': 'true' }),
     el('h2', { text: 'The model isn’t loaded yet' }),
     el('p', { class: 'dim', text: dl
-      ? `Run the prompt above (or press Step) and the page will offer to download SmolLM2-135M-Instruct: ${mb(MODEL_INFO ? MODEL_INFO.bytes : 269060552)}, once, then cached in your browser. Every view below is computed from the real model in this tab.`
+      ? `Run the prompt above (or press Step) and the page will offer to download SmolLM2-135M: ${mb(MODEL_INFO ? MODEL_INFO.bytes : 269060552)}, once, then cached in your browser. Every view below is computed from the real model in this tab.`
       : 'It’s in your browser cache already; run the prompt to load it.' }),
     el('button', { class: 'primary', onclick: () => $('#run').click() }, svgIcon('M4 2.5v11l9-5.5z'), dl ? 'Download & run the prompt' : 'Load & run the prompt'));
 }
 
 // ------------------------------------------------------------------ about the model
 //
-// A static description of SmolLM2-135M-Instruct, from its config.json and
+// A static description of SmolLM2-135M, from its config.json and
 // model card, so it can be read before the weights are downloaded.
 
 const CFG = {
@@ -1142,17 +595,16 @@ const M = (n) => (n >= 1e6 ? (n / 1e6).toFixed(n >= 1e8 ? 1 : 2) + 'M' : n >= 1e
 
 // Close the dialog and show one of the completion tabs.
 function gotoTab(id) {
-  id = shownTab(id);
+  id = tabOf(id);
   $('#info').close();
-  if (MODE !== 'complete') setMode('complete');
   const b = document.querySelector(`#tabs button[data-tab="${id}"]`);
   if (b && !b.classList.contains('active')) b.click();
 }
 
 function buildInfo() {
   const c = CFG, kvBytes = c.layers * 2 * c.kv_heads * c.head_dim * 4;
-  const see = (tab, name) => {
-    name = tabName(shownTab(tab));
+  const see = (tab) => {
+    const name = tabName(tab);
     return el('button', { class: 'see', type: 'button', onclick: () => gotoTab(tab), title: `close this and open the ${name} tab` }, name + ' →');
   };
   const stat = (v, label, hint) => el('div', { class: 'stat', title: hint || '' }, el('b', { text: v }), el('span', { text: label }));
@@ -1170,9 +622,9 @@ function buildInfo() {
   return [
     el('div', { class: 'info-head' },
       el('div', {},
-        el('h2', { id: 'info-title' }, 'SmolLM2-135M-', el('span', { class: 'grad', text: 'Instruct' })),
+        el('h2', { id: 'info-title' }, 'SmolLM2-', el('span', { class: 'grad', text: '135M' })),
         el('div', { class: 'dim' }, 'by Hugging Face · Apache 2.0 · Llama architecture · ',
-          el('a', { href: 'https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct', target: '_blank', rel: 'noopener', text: 'model card' }), ' · ',
+          el('a', { href: 'https://huggingface.co/HuggingFaceTB/SmolLM2-135M', target: '_blank', rel: 'noopener', text: 'model card' }), ' · ',
           el('a', { href: 'https://arxiv.org/abs/2502.02737', target: '_blank', rel: 'noopener', text: 'paper' }))),
       el('button', { class: 'icon close', type: 'button', autofocus: true, 'aria-label': 'Close', title: 'Close (Esc)', onclick: () => $('#info').close() },
         svgIcon('M4 4l8 8M12 4l-8 8'))),
@@ -1191,26 +643,26 @@ function buildInfo() {
     el('h3', { text: 'Structure' }),
     el('p', { class: 'dim', text: `A decoder-only transformer. Every position carries one ${c.hidden}-number vector (the residual stream); each layer reads it through a norm and adds its result back. T is the number of tokens.` }),
     el('div', { class: 'arch' },
-      box('io', 'Tokenizer', 'text → token ids (byte-level BPE)', '[T]', see('next', 'Next token')),
+      box('io', 'Tokenizer', 'text → token ids (byte-level BPE)', '[T]', see('next')),
       arrow(),
-      box('emb', 'Token embedding', `look up row id of a ${c.vocab.toLocaleString()} × ${c.hidden} table`, `[T, ${c.hidden}]`, see('resid', 'Residual stream')),
+      box('emb', 'Token embedding', `look up row id of a ${c.vocab.toLocaleString()} × ${c.hidden} table`, `[T, ${c.hidden}]`, see('walk')),
       arrow(),
       el('div', { class: 'loop' },
         el('div', { class: 'loop-tag', text: `× ${c.layers} layers` }),
         box('nrm', 'RMSNorm', `scale x to unit RMS, then by a learned ${c.hidden}-vector`, null),
         arrow(),
-        box('att', 'Grouped-query self-attention', `q: ${c.heads} heads, k & v: ${c.kv_heads} heads, ${c.head_dim} dims each · RoPE on q and k · causal mask · softmax(q·kᵀ/√${c.head_dim})·v · output projection`, `[T, ${c.hidden}]`, see('attn', 'Attention')),
+        box('att', 'Grouped-query self-attention', `q: ${c.heads} heads, k & v: ${c.kv_heads} heads, ${c.head_dim} dims each · RoPE on q and k · causal mask · softmax(q·kᵀ/√${c.head_dim})·v · output projection`, `[T, ${c.hidden}]`, see('walk')),
         el('div', { class: 'add', text: '+ add back into the residual stream' }),
         box('nrm', 'RMSNorm', 'a second, separate norm', null),
         arrow(),
         box('mlp', 'SwiGLU MLP', `down( silu(gate·x) ⊙ up·x ): ${c.hidden} → ${c.inter.toLocaleString()} → ${c.hidden}, per position`, `[T, ${c.hidden}]`, null),
         el('div', { class: 'add', text: '+ add back into the residual stream' })),
       arrow(),
-      box('nrm', 'Final RMSNorm', '', `[T, ${c.hidden}]`, see('lens', 'Logit lens')),
+      box('nrm', 'Final RMSNorm', '', `[T, ${c.hidden}]`, see('walk')),
       arrow(),
       box('emb', 'Output head (tied)', 'dot product with every row of the embedding table', `[T, ${c.vocab.toLocaleString()}]`, null),
       arrow(),
-      box('io', 'Softmax + sampler', 'logits → probabilities → one token', '1 token', see('next', 'Next token'))),
+      box('io', 'Softmax + sampler', 'logits → probabilities → one token', '1 token', see('next'))),
 
     el('h3', { text: 'Where the parameters are' }),
     el('div', { class: 'share' }, share.map(([name, n, cls]) => el('div', { class: 'srow' },
@@ -1223,32 +675,27 @@ function buildInfo() {
     el('ul', { class: 'feats' },
       feat('Pre-norm with RMSNorm.', `Each sublayer normalizes its input (ε = 10⁻⁵) and adds its output back, so the residual stream is a running sum. No biases anywhere in the model.`),
       feat('Rotary position embeddings (RoPE).', `Position isn't added to the input; q and k are rotated by an angle that grows with position (base θ = ${c.rope_theta.toLocaleString()}, rotate-half layout), so q·k depends on the distance between tokens.`),
-      feat('Grouped-query attention.', `${c.heads} query heads share ${c.kv_heads} key/value heads, three per group. The KV cache is 3× smaller: ${(kvBytes / 1e3).toFixed(0)} KB per token here (f32), ${(kvBytes / 2e3).toFixed(0)} KB in the original bf16.`, ' ', see('kv', 'KV cache')),
+      feat('Grouped-query attention.', `${c.heads} query heads share ${c.kv_heads} key/value heads, three per group. The KV cache is 3× smaller: ${(kvBytes / 1e3).toFixed(0)} KB per token here (f32), ${(kvBytes / 2e3).toFixed(0)} KB in the original bf16.`),
       feat('SwiGLU MLP.', `Two parallel projections up to ${c.inter.toLocaleString()}; one goes through SiLU and gates the other element-wise, then a third projects back down. It holds most of the parameters.`),
       feat('Tied embeddings.', `The output head is the embedding table itself, which saves ${M(P.embed)} parameters.`),
       feat('Deep and narrow.', `${c.layers} layers of width ${c.hidden}: a deep, narrow shape, common for models under a billion parameters.`)),
 
-    el('h3', { text: 'Tokenizer and chat format' }),
+    el('h3', { text: 'Tokenizer' }),
     el('ul', { class: 'feats' },
       feat('Byte-level BPE,', `${c.vocab.toLocaleString()} tokens built from ${c.merges.toLocaleString()} merges. Any byte sequence can be encoded, so there's no "unknown" token. Digits are always split one per token.`),
-      feat(`${c.specials} special tokens`, 'at ids 0–16, mostly for code (<file_sep>, <jupyter_code>…). The ones chat uses: <|endoftext|> (0), <|im_start|> (1), <|im_end|> (2, which ends a reply).'),
-      feat('ChatML.', 'A conversation is plain text the model completes:')),
-    el('pre', { class: 'chatml' },
-      el('span', { class: 'sp', text: '<|im_start|>' }), 'system\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face', el('span', { class: 'sp', text: '<|im_end|>' }), '\n',
-      el('span', { class: 'sp', text: '<|im_start|>' }), 'user\nWhat is the capital of France?', el('span', { class: 'sp', text: '<|im_end|>' }), '\n',
-      el('span', { class: 'sp', text: '<|im_start|>' }), 'assistant\n', el('span', { class: 'gen', text: 'The capital of France is Paris.' }), el('span', { class: 'sp', text: '<|im_end|>' })),
+      feat(`${c.specials} special tokens`, 'at ids 0–16, mostly for code (<file_sep>, <jupyter_code>…). <|endoftext|> (0) separates documents: when the model produces it, it considers the text finished.')),
 
     el('h3', { text: 'Training' }),
     el('ul', { class: 'feats' },
       feat('Pretraining:', '2 trillion tokens of FineWeb-Edu, DCLM and The Stack, plus new filtered datasets; bfloat16, on 64 H100s with nanotron.'),
-      feat('Instruct tuning:', 'supervised fine-tuning on smol-smoltalk, then Direct Preference Optimization (DPO) on UltraFeedback.'),
+      feat('A base model:', 'it was only trained to continue text, so it continues whatever you write. It does not follow instructions or answer questions the way a chat model does; that takes further fine-tuning (SmolLM2-135M-Instruct is that version).'),
       feat('Limits:', 'mostly English. At 135M parameters it’s fluent but often wrong, and it loops easily without an anti-repetition sampler.')),
 
     el('h3', { text: 'In this engine' }),
     el('ul', { class: 'feats' },
       feat('Weights', `are stored in bfloat16 (${Math.round((P.total * 2) / 1e6)} MB) and converted to f32 on load (${Math.round((P.total * 4) / 1e6)} MB in memory).`),
-      feat('Context:', `chat holds 2,048 positions and the completion inspector 512 (it records every activation at every position); the model itself was trained on ${c.ctx.toLocaleString()}.`),
-      feat('Sampling defaults:', 'chat uses the model card’s temperature 0.2 and top-p 0.9, plus DRY 0.8 against loops; completion uses temperature 0.7.')),
+      feat('Context:', `the page holds 512 positions (it records every activation at every position); the model itself was trained on ${c.ctx.toLocaleString()}.`),
+      feat('Sampling default:', 'the Focused preset: the model’s own top token, with DRY 0.8 against loops. The presets next to the prompt switch to others.')),
   ];
 }
 
@@ -1259,7 +706,7 @@ function buildGlossary() {
   const items = GLOSSARY.map((g) => {
     const node = el('div', { class: 'gitem', id: 'g-' + g.t.toLowerCase().replace(/[^a-z0-9]+/g, '-') },
       el('div', { class: 'gterm' }, el('b', { text: g.t }), g.tab ? el('button', { class: 'see', type: 'button', onclick: () => gotoTab(g.tab), title: 'close this and open that tab' },
-        'see it: ' + tabName(shownTab(g.tab)) + ' →') : null),
+        'see it: ' + tabName(g.tab) + ' →') : null),
       el('p', { text: g.d }),
       el('div', { class: 'glinks' }, g.l.map(([label, href]) => el('a', { href, target: '_blank', rel: 'noopener' }, label, ' ↗'))));
     return { g, node, hay: [g.t, g.aka || '', g.d].join(' ').toLowerCase() };
@@ -1309,332 +756,8 @@ function showInfoView(view) {
 }
 $('#info-btn').onclick = () => openInfo();
 
-// ------------------------------------------------------------------ modes
-
-let MODE = 'complete';
-
-function setMode(mode) {
-  MODE = mode;
-  $('#complete-view').hidden = mode !== 'complete';
-  $('#chat-view').hidden = mode !== 'chat';
-  document.querySelectorAll('#modes button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
-  moveInk($('#modes'));
-  const view = $(mode === 'chat' ? '#chat-view' : '#complete-view');
-  view.classList.remove('appear'); void view.offsetWidth; view.classList.add('appear');
-  if (mode === 'complete') moveInk($('#tabs')); // it had no size while hidden
-  history.replaceState(null, '', '#' + (mode === 'chat' ? 'chat' : S.tab));
-  hideTip();
-  if (mode === 'chat') {
-    if (READY && !C.st) refreshChat();
-    $('#chat-input').focus();
-  } else if (S.st) {
-    renderTokens();
-    renderTab();
-  }
-}
-
-// ------------------------------------------------------------------ chat mode
-//
-// A normal chat app on top of the same engine, with a lighter look inside:
-// each reply token is tinted by how unsure the model was (hover for the
-// alternatives), and the side panel shows what each turn cost.
-
-const C = {
-  st: null,          // chat_state from the engine
-  busy: false,
-  stopRequested: false,
-  raw: false,        // show the raw token stream instead of bubbles
-  tint: true,        // tint uncertain tokens
-};
-
-function chatSamp() {
-  return {
-    temperature: numIn('#c-temp', 0, 0),
-    top_p: numIn('#c-topp', 1, 0, 1),
-    repeat_penalty: numIn('#c-rep', 1, 0.01, 100),
-    dry: numIn('#c-dry', 0, 0, 100),
-    end_bias: numIn('#c-end', 0, 0, 10),
-  };
-}
-
-// Two different things can make a reply token interesting, and they are marked
-// apart: the model itself was unsure (its favourite had under half the
-// probability: blue tint), or the sampler picked something other than the
-// model's favourite (orange underline). Every token carries p (the model's own
-// probability) and q (the chance the sampler gave it after the repetition
-// penalty, DRY, the wrap-up bias, temperature and top-p).
-function tintOf(top) {
-  // Confident tokens stay plain; the less sure the model was, the stronger the tint.
-  const a = Math.max(0, Math.min(0.6, (1 - top) * 0.75));
-  return a < 0.04 ? '' : `rgba(127,163,207,${a.toFixed(2)})`;
-}
-
-const tokenTop = (t) => t.alts[0][1];
-const overridden = (t) => t.text !== t.alts[0][0];
-
-function markToken(span, t) {
-  span.style.background = C.tint ? tintOf(tokenTop(t)) : '';
-  span.style.boxShadow = C.tint && overridden(t) ? 'inset 0 -2px 0 var(--accent)' : '';
-}
-
-function tokenTip(e, t) {
-  const [favText, favP] = t.alts[0];
-  const odds = (q) => (q > 0 ? pct(q) : '—');
-  // The sampler's favourite: the listed token it gave the most chance.
-  const samplerFav = t.alts.reduce((a, b) => (b[2] > a[2] ? b : a));
-  let why;
-  if (!overridden(t)) {
-    why = favP < 0.5
-      ? `the model was unsure here: its favourite had only ${pct(favP)}`
-      : 'the model\'s favourite, picked';
-  } else if (samplerFav[0] === t.text) {
-    why = `not the model's favourite (${JSON.stringify(favText)} at ${pct(favP)}): the repetition penalty, DRY or the wrap-up bias pushed it down, so the sampler preferred this one`;
-  } else {
-    why = `not the model's favourite (${JSON.stringify(favText)} at ${pct(favP)}): a random draw at this temperature, which gave it ${odds(t.q)}`;
-  }
-  const head = (text) => el('span', { class: 'dim', text });
-  showTip(e,
-    el('b', { text: `chose ${JSON.stringify(t.text)}` }),
-    el('div', { class: 'bars', style: 'margin:6px 0;grid-template-columns:max-content max-content max-content' },
-      head(''), head('model'), head('sampler'),
-      t.alts.map(([text, p, q]) => [
-        el('span', { class: 'mono', style: text === t.text ? 'color:var(--accent)' : '', text: clip(vis(text), 16) }),
-        el('span', {}, el('div', { class: 'bar', style: `display:inline-block;width:${Math.max(1, p * 90)}px;margin-right:6px` }), pct(p)),
-        el('span', {}, el('div', { class: 'bar alt', style: `display:inline-block;width:${Math.max(1, q * 90)}px;margin-right:6px` }), odds(q))])),
-    el('div', { class: 'dim', style: 'max-width:340px', text: why }));
-}
-
-// Append reply tokens to an assistant bubble. Bytes go through a streaming UTF-8
-// decoder, because one character (emoji, CJK) can be split over several tokens.
-function appendTokens(bubble, tokens) {
-  for (const t of tokens) {
-    const piece = bubble.decoder.decode(new Uint8Array(t.bytes), { stream: true });
-    const span = el('span', { class: 'ct', text: piece });
-    span.tok = t;
-    markToken(span, t);
-    span.onmousemove = (e) => tokenTip(e, t);
-    span.onmouseleave = hideTip;
-    bubble.body.append(span);
-  }
-  const box = $('#messages');
-  box.scrollTop = box.scrollHeight;
-}
-
-// End of a reply: a character cut off mid-way (the reply stopped inside an
-// emoji, say) is still in the decoder. Flush it as U+FFFD rather than drop it.
-function finishBubble(bubble) {
-  const tail = bubble.decoder.decode();
-  if (tail) bubble.body.append(el('span', { class: 'ct', text: tail }));
-}
-
-function addBubble(role, text) {
-  const body = el('div', { class: 'body' }, text || '');
-  const meta = el('div', { class: 'meta dim' });
-  const node = role === 'assistant'
-    ? el('div', { class: 'msg assistant' }, el('div', { class: 'avatar', 'aria-hidden': 'true' }), el('div', { class: 'bubble' }, el('div', { class: 'dots', 'aria-hidden': 'true' }, el('i'), el('i'), el('i')), body, meta))
-    : el('div', { class: 'msg ' + role }, el('div', { class: 'bubble' }, body, meta));
-  $('#messages').append(node);
-  $('#messages').scrollTop = $('#messages').scrollHeight;
-  return { node, body, meta, decoder: new TextDecoder() };
-}
-
-function renderChatRaw() {
-  const box = $('#messages');
-  const toks = C.st ? C.st.tokens : [];
-  box.replaceChildren(
-    el('p', { class: 'explain' }, 'This is exactly what the model sees: ', B(`${toks.length} tokens`),
-      '. Chat is still text completion. The conversation is written in the ChatML format the model was fine-tuned on, ',
-      'and the reply is the model completing it. Each ', el('span', { class: 'mono', style: 'color:var(--accent)', text: '<|im_start|>' }),
-      ' / ', el('span', { class: 'mono', style: 'color:var(--accent)', text: '<|im_end|>' }),
-      ' is a single special token. The model ends its turn by producing <|im_end|> itself.'),
-    el('div', { class: 'rawstream' }, toks.map((t) => el('span', { class: 'tok' + (t.special ? ' special' : ''), text: vis(t.text), title: `id ${t.id}` }))));
-}
-
-let chatLog = []; // [{role, text} | {role:'assistant', tokens, stop}] for re-rendering
-
-function renderChatBubbles() {
-  $('#messages').replaceChildren();
-  if (!chatLog.length) {
-    const ideas = ['What is the capital of France?', 'Write a haiku about the sea.', 'Explain photosynthesis to a child.', 'Tell me a two-sentence story about a robot.'];
-    $('#messages').append(el('div', { class: 'empty' },
-      el('div', { class: 'empty-orb', 'aria-hidden': 'true' }),
-      el('h2', { text: 'Chat with SmolLM2-135M-Instruct' }),
-      el('p', { class: 'dim', text: 'A tiny model (135M parameters) running in this tab: fluent and quick, but often wrong. Hover any word of a reply to see what else it considered.' }),
-      !READY && MODEL_INFO && !MODEL_INFO.cached
-        ? el('p', { class: 'dim small', text: `Your first message downloads the model (${mb(MODEL_INFO.bytes)}, once). The page asks before it does.` }) : null,
-      el('div', { class: 'ideas' }, ideas.map((t) => el('button', { class: 'idea', text: t, onclick: () => { $('#chat-input').value = t; sendChat(); } })))));
-    return;
-  }
-  for (const m of chatLog) {
-    if (m.role === 'user') { addBubble('user', m.text); continue; }
-    const b = addBubble('assistant');
-    appendTokens(b, m.tokens);
-    finishBubble(b);
-    if (m.stop) b.meta.textContent = m.stop;
-  }
-}
-
-function renderMessages() {
-  C.raw ? renderChatRaw() : renderChatBubbles();
-}
-
-function renderChatSide() {
-  if (!C.st) return;
-  const c = C.st.context, t = C.st.last_turn;
-  $('#c-ctxbar').style.width = (100 * c.len / c.max_seq).toFixed(1) + '%';
-  $('#c-ctx').textContent = `${c.len} / ${c.max_seq} tokens · KV cache ${fmtBytes(c.bytes)}`;
-  const turn = $('#c-turn');
-  if (!t) { turn.replaceChildren(el('span', { class: 'dim', text: 'nothing yet' })); return; }
-  const rate = t.generated / Math.max(1e-6, t.decode_ms / 1000);
-  turn.replaceChildren(...[
-    el('div', {}, B(String(t.prefilled)), ' new tokens prefilled in one pass', el('span', { class: 'dim', text: ` (${t.prefill_ms.toFixed(0)} ms)` })),
-    el('div', {}, B(String(t.reused)), ' earlier tokens reused from the KV cache'),
-    el('div', {}, B(String(t.generated)), ' tokens generated', t.generated ? el('span', { class: 'dim', text: ` · ${rate.toFixed(0)} tok/s` }) : null),
-    overrideLine(),
-    t.stop ? el('div', { class: 'dim', text: t.stop }) : null].filter(Boolean));
-}
-
-// How often the sampler overruled the model in the latest reply.
-function overrideLine() {
-  const last = chatLog.findLast((m) => m.role === 'assistant');
-  if (!last || !last.tokens.length) return null;
-  const n = last.tokens.filter(overridden).length;
-  return el('div', { title: 'picks that were not the model\'s own favourite (underlined orange in the reply)' },
-    B(String(n)), ` of ${last.tokens.length} picks overruled the model`, el('span', { class: 'dim', text: ` (${pct(n / last.tokens.length)})` }));
-}
-
-async function refreshChat() {
-  C.st = await call('chat_state');
-  // The sliders are the source of truth: every chat_step sends them.
-  if (!$('#c-system').value) $('#c-system').value = C.st.system;
-  renderChatSide();
-  // Bubbles are built incrementally while chatting; only the raw view is redrawn from state.
-  if (C.raw) renderChatRaw();
-}
-
-function setChatBusy(on) {
-  C.busy = on;
-  document.body.classList.toggle('working', on);
-  $('#send').hidden = on;
-  $('#stop').hidden = !on;
-  $('#reset').disabled = on;
-}
-
-async function sendChat() {
-  const input = $('#chat-input');
-  const text = input.value.trim();
-  if (!text || C.busy) return;
-  if (!READY && (!(await ensureModel()) || C.busy)) return; // C.busy: a second Enter while it loaded
-  input.value = '';
-  setChatBusy(true);
-  C.stopRequested = false;
-  if (C.raw) { C.raw = false; $('#c-raw').checked = false; renderMessages(); }
-  if (!chatLog.length) $('#messages').replaceChildren();
-  chatLog.push({ role: 'user', text });
-  addBubble('user', text);
-  const msg = { role: 'assistant', tokens: [], stop: '' };
-  const bubble = addBubble('assistant');
-  bubble.node.classList.add('streaming', 'waiting');
-  try {
-    C.st = await call('chat_send', { text });
-    chatLog.push(msg);
-    renderChatSide();
-    for (;;) {
-      if (C.stopRequested) { await call('chat_stop'); msg.stop = 'stopped'; break; }
-      const r = await call('chat_step', { n: 2, ...chatSamp() });
-      msg.tokens.push(...r.tokens);
-      if (r.tokens.length) bubble.node.classList.remove('waiting');
-      appendTokens(bubble, r.tokens);
-      C.st.context = r.context;
-      C.st.last_turn = r.last_turn;
-      renderChatSide();
-      if (r.done) { msg.stop = r.stop || ''; break; }
-    }
-  } catch (e) {
-    msg.stop = 'error: ' + e.message;
-    flash(e.message);
-  } finally {
-    finishBubble(bubble);
-    bubble.node.classList.remove('streaming', 'waiting');
-    bubble.meta.textContent = msg.stop;
-    setChatBusy(false);
-    try { C.st = await call('chat_state'); renderChatSide(); } catch {}
-    input.focus();
-  }
-}
-
-async function newChat() {
-  if (C.busy) return;
-  if (!READY) { chatLog = []; renderMessages(); $('#chat-input').focus(); return; }
-  C.st = await call('chat_reset', { system: $('#c-system').value });
-  chatLog = [];
-  renderChatSide();
-  renderMessages();
-  $('#chat-input').focus();
-}
-
-// Hand the conversation to completion mode for the full set of views, as the
-// exact token ids chat produced. The inspector keeps a full trace per position,
-// so it holds fewer positions than chat; a long conversation is cut to its tail.
-async function inspectChat() {
-  if (C.busy || !C.st || !C.st.tokens.length) return;
-  const limit = S.st.cache.max_seq - 8;
-  let toks = C.st.tokens;
-  if (toks.length > limit) {
-    toks = toks.slice(-limit);
-    flash(`The conversation is ${C.st.tokens.length} tokens; the inspector holds ${S.st.cache.max_seq} positions (it stores every activation at every position), so it shows the last ${limit}.`);
-  }
-  $('#prompt').value = toks.map((t) => t.text).join('');
-  setMode('complete');
-  await act(async () => setState(await call('run', { ids: toks.map((t) => t.id) }), 'last'));
-}
-
-function setupChat() {
-  const chatPreset = presetPicker('c-', 'focused');
-  const raw = el('input', { type: 'checkbox', id: 'c-raw' });
-  raw.onchange = () => { C.raw = raw.checked; if (C.raw) refreshChat(); else renderMessages(); };
-  const tint = el('input', { type: 'checkbox' });
-  tint.checked = true;
-  tint.onchange = () => {
-    C.tint = tint.checked;
-    document.querySelectorAll('.msg .ct').forEach((s) => s.tok && markToken(s, s.tok));
-  };
-  $('#chat-side').append(
-    el('h3', { text: 'context window' }),
-    el('div', { class: 'ctxbar' }, el('i', { id: 'c-ctxbar' })),
-    el('div', { id: 'c-ctx', class: 'dim small' }),
-    el('h3', { text: 'last turn' }),
-    el('div', { id: 'c-turn', class: 'small turn' }),
-    el('p', { class: 'explain small' },
-      'Only the new tokens of each turn go through the model in one pass (', B('prefill'), '); everything before is already in the ',
-      B('KV cache'), '. The reply then comes one token at a time (', B('decode'), '), each step reading the whole cache.'),
-    el('h3', { text: 'view' }),
-    el('label', { class: 'block' }, tint, 'mark unsure tokens (blue) and off-favourite picks (orange)'),
-    el('label', { class: 'block' }, raw, 'show the raw token stream'),
-    el('button', { class: 'wide', text: 'Inspect this conversation →', title: 'open the transcript in completion mode with every view', onclick: () => inspectChat() }),
-    el('h3', { text: 'sampling' }),
-    el('div', { class: 'knob preset' }, el('span', { text: 'preset' }), chatPreset.sel),
-    chatPreset.about,
-    el('div', { class: 'knobs stack' },
-      knob('c-temp', 'temperature', 0, 2, 0.05, 0, 'Divide the logits by this before softmax. 0 = always the top token', { zero: 'greedy' }),
-      knob('c-topp', 'top-p', 0, 1, 0.01, 0.9, 'Keep the smallest set of tokens whose probabilities add up to p', { max: 'off' }),
-      knob('c-dry', 'anti-loop (DRY)', 0, 2, 0.05, 0.8, 'Push down a word that would continue a sequence that already appeared, harder the longer the repeat. Numbers and punctuation are exempt', { zero: 'off' }),
-      knob('c-rep', 'repeat penalty', 1, 2, 0.01, 1, 'Push down words used in the last 64 positions. Numbers and punctuation are exempt, so arithmetic still works', { min: 'off' }),
-      knob('c-end', 'wrap-up', 0, 0.2, 0.01, 0.05, 'After 40 tokens, raise the chance of ending the reply by this much (in logits) per extra token: keeps answers from rambling', { zero: 'off' })),
-    el('h3', { text: 'system prompt' }),
-    el('textarea', { id: 'c-system', rows: 3, spellcheck: 'false', text: 'You are a helpful AI assistant named SmolLM, trained by Hugging Face' }),
-    el('button', { class: 'wide', text: 'New chat', title: 'clear the conversation (applies the system prompt)', onclick: () => newChat() }));
-
-  chatPreset.wire();
-  $('#composer').onsubmit = (e) => { e.preventDefault(); sendChat(); };
-  $('#chat-input').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
-  });
-  $('#stop').onclick = () => (C.stopRequested = true);
-  $('#reset').onclick = () => newChat();
-  document.querySelectorAll('#modes button').forEach((b) => (b.onclick = () => setMode(b.dataset.mode)));
-  renderMessages();
-}
+// A tooltip shouldn't outlive the mouse leaving its element by scrolling.
+addEventListener('scroll', () => hideTip(), { passive: true });
 
 // ------------------------------------------------------------------ wiring
 
@@ -1650,15 +773,27 @@ async function withModel(fn) {
 }
 $('#prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $('#run').click(); } });
 for (const id of ['#temp', '#topp', '#topk', '#rep', '#dry']) $(id).addEventListener('input', () => { if (S.tab === 'next') renderTab(); });
+// The sampler settings live in a popover (#sampler-menu) opened by the
+// Sampler button, which names the active preset.
 {
-  const p = presetPicker('', 'focused');
-  $('#controls .knobs').prepend(el('div', { class: 'knob preset' }, el('span', { text: 'sampler preset' }), p.sel));
-  $('#controls').append(p.about);
+  const p = presetPicker('', 'focused', (name) => ($('#sampler-name').textContent = ' · ' + name));
+  const menu = $('#sampler-menu');
+  menu.querySelector('.knobs').prepend(el('div', { class: 'knob preset' }, el('span', { text: 'preset' }), p.sel));
+  menu.querySelector('.knobs').after(p.about);
   p.wire();
+  // Popovers open in the top layer, centred; place this one under its button.
+  menu.addEventListener('beforetoggle', (e) => {
+    if (e.newState !== 'open') return;
+    const b = $('#sampler-btn').getBoundingClientRect();
+    menu.style.top = `${b.bottom + 8}px`;
+    menu.style.left = `${Math.max(8, Math.min(b.right - 320, innerWidth - 328))}px`;
+  });
+  addEventListener('resize', () => menu.hidePopover());
+  addEventListener('scroll', () => { if (menu.matches(':popover-open')) menu.hidePopover(); }, { passive: true });
 }
 document.addEventListener('keydown', (e) => {
-  // defaultPrevented: a tab (Flow, Step by step) already used the arrow key.
-  if (MODE !== 'complete' || !S.st || e.defaultPrevented || e.target.matches('textarea, input, select')) return;
+  // defaultPrevented: the Step-by-step tab already used the arrow key.
+  if (!S.st || e.defaultPrevented || e.target.closest?.('textarea, input, select')) return;
   if (e.key === 'ArrowLeft' && S.sel > 0) S.sel--;
   else if (e.key === 'ArrowRight' && S.sel < S.st.tokens.length - 1) S.sel++;
   else return;
@@ -1669,11 +804,9 @@ document.addEventListener('keydown', (e) => {
 
 (async () => {
   const fromHash = location.hash.slice(1);
-  if (TABS.some((t) => t[0] === fromHash)) S.tab = shownTab(fromHash);
+  if (TABS.some((t) => t[0] === fromHash)) S.tab = fromHash;
   renderTabs();
-  setupChat();
   document.querySelectorAll('input[type=range]').forEach(syncRange);
-  setMode(fromHash === 'chat' ? 'chat' : 'complete');
   try {
     if (NATIVE) {
       MODEL_INFO = { cached: true };
@@ -1685,7 +818,6 @@ document.addEventListener('keydown', (e) => {
     renderModelChip();
     renderTokens();
     renderTab();
-    if (!chatLog.length) renderMessages();
     // Already downloaded on an earlier visit: load it straight away, no questions.
     if (MODEL_INFO.cached) await ensureModel({ ask: false });
   } catch (e) {

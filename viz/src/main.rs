@@ -52,7 +52,7 @@ fn main() -> engine::Result<()> {
             _ => return Err(format!("unknown argument {a} (use --port N, --static)").into()),
         }
     }
-    let spec = &download::SMOLLM2_135M_INSTRUCT;
+    let spec = &download::SMOLLM2_135M;
     let models = concat!(env!("CARGO_MANIFEST_DIR"), "/../models");
     let dir = format!("{models}/{}", spec.dir);
     // The in-browser engine fetches from /models/ on localhost, so make sure it's there.
@@ -63,7 +63,7 @@ fn main() -> engine::Result<()> {
     if !stat {
         let model = Model::load(&dir)?;
         let tok = Tokenizer::from_file(format!("{dir}/tokenizer.json"))?;
-        let session = Session::new(model, tok, spec.dir, 1024, 2048)?;
+        let session = Session::new(model, tok, spec.dir, 1024)?;
         app = app.route("/api/call/{method}", post(call).with_state(Arc::new(Mutex::new(session))));
     }
     let app = app.nest_service("/models", ServeDir::new(models)).fallback_service(ServeDir::new(web));

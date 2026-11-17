@@ -6,15 +6,15 @@
 right away and asks before it downloads anything: the first time you run a prompt, it offers to fetch the 269 MB model
 from Hugging Face, and later visits load it from the browser cache without asking.
 
-llm-view is a from-scratch inference engine for [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct), written in Rust,
+llm-view is a from-scratch inference engine for [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M), written in Rust,
 plus a visualizer that runs entirely in your browser. Every intermediate tensor of the forward pass goes through a hook,
-so you can see the residual stream evolve, the attention heads at work, the KV cache filling up, and the next-token
-distribution being reshaped by the sampler.
+so you can follow your prompt through the network one operation at a time, with the real numbers, and watch the
+next-token distribution being reshaped by the sampler.
+
+The model is the base (not chat) one: it continues whatever text you give it.
 
 It is built for learning: the engine is small enough to read in an afternoon, and it matches Hugging Face
 `transformers` tensor by tensor.
-
-![The logit lens: what the model would predict after each of its 30 layers](docs/lens.png)
 
 ## What's inside
 
@@ -32,39 +32,27 @@ It is built for learning: the engine is small enough to read in an afternoon, an
 
 ## The visualizer
 
-**Completion mode** runs raw text through the model and lets you poke at every layer. For now the page shows only
-**Next token** and **Step by step**; the other tabs are hidden (`SHOWN_TABS` in `viz/web/app.js` brings them back):
+Type the start of a text and run it. Two tabs:
 
 | Tab | What you see |
 |---|---|
-| **Next token** | The model's distribution (blue) and what the sampler turns it into (orange). Drag temperature, top-p, top-k and the penalties and watch the bars move. Click a token to force it. |
-| **Flow** | One position's trip through the whole network. A map shows, layer by layer, which earlier tokens each attention write came from and how each layer moves the final answer; open any stage to see every vector it computes (q, k, v, RoPE, scores, each head, the MLP's gate/up/neurons, the residual adds) with the real numbers, and read any write as the tokens it pushes up. |
-| **Step by step** | The forward pass one operation at a time, on the whole prompt as `[tokens, …]` matrices: tokenize, one-hot × embedding table, RMSNorm (measure, divide, × gain), q/k/v projections, split into heads, RoPE, scores, causal mask, softmax, weighted sum of values, output projection, residual add, then the MLP, and finally the norm, logits and softmax. Each step names the checkpoint tensors it uses (`model.layers.0.self_attn.q_proj.weight [576, 576]`), gives the formula with shapes, and shows the real numbers. Next / Back, or ← / →. An **Explain** button opens a prose explanation of each step, with links to papers, Wikipedia and videos. |
-| **Logit lens** | Project the residual stream onto the vocabulary after every layer: watch the answer form from the bottom up, see where it "locks in", and follow its probability layer by layer. |
-| **Attention** | Every head of every layer as a heatmap, grouped by the KV head they share (GQA). Ablate heads and re-run to see what breaks. |
-| **KV cache** | What's actually stored per layer and position, and why decoding one token is cheap. |
-| **Residual stream** | The 576-dimensional working memory: how much each layer's attention and MLP write into it, position by position. |
+| **Next token** | The model's distribution (blue) and what the sampler turns it into (orange). Change temperature, top-p, top-k and the penalties in the **Sampler** menu and watch the bars move. Click a token to force it. |
+| **Step by step** | The forward pass one operation at a time, on the whole prompt as `[tokens, …]` matrices: tokenize, one-hot × embedding table, RMSNorm (measure, divide, × gain), q/k/v projections, split into heads, RoPE, scores, causal mask, softmax, weighted sum of values, output projection, residual add, then the MLP, and a peek (marked as not part of the model) at what the stream would predict if the model stopped after that layer (the logit lens). Next continues into the following layer; after layer 29 come the final norm, logits and softmax. Each step names the checkpoint tensors it uses (`model.layers.0.self_attn.q_proj.weight [576, 576]`), gives the formula with shapes, and shows the real numbers. Next / Previous, or ← / →. An **Explain** button opens a prose explanation of each step, with links to papers, Wikipedia and videos. |
 
-Step one token at a time, generate 16 at once, or double-click a token to rewind the KV cache to that point.
-
-**Chat mode** is a normal chat app with a lighter look inside: replies stream token by token, uncertain tokens are
-tinted (hover for the alternatives the model considered), a sidebar shows how much of each turn was prefilled versus
-reused from the KV cache, and one click opens the whole conversation in completion mode for the full set of views.
-
-![Chat mode](docs/chat.png)
+Step one token at a time, generate 16 at once, or double-click a token to rewind the KV cache to that point. The
+**About the model** dialog has a glossary of the terms the page uses.
 
 ## Quick start
 
 You need [Rust](https://rustup.rs) (stable). Model weights are downloaded from Hugging Face on first run
 (270 MB for 135M) and verified against a pinned SHA-256.
 
-**Chat in the terminal:**
+**Text completion in the terminal:**
 
 ```sh
-cargo run                      # SmolLM2-360M-Instruct chat REPL
-cargo run -- --size 135m       # the small one
-cargo run -- --complete        # raw text completion instead of chat
-cargo run -- --help            # sampling flags: --temp, --top-p, --top-k, --dry, --repeat-penalty, ...
+cargo run                      # SmolLM2-135M: type the start of a text, it continues it
+cargo run -- --size 360m       # the bigger one
+cargo run -- --help            # sampling flags: --temp, --top-p, --top-k, --dry, --repeat-penalty, -n, ...
 ```
 
 **The visualizer:**
@@ -81,37 +69,16 @@ model itself, and `?native` makes the page use it instead of WebAssembly, which 
 **Deploying:** `viz/web/` is a fully static site. Build the wasm, then upload that folder to any static host
 (GitHub Pages, Cloudflare Pages, S3). Visitors download the weights from Hugging Face directly.
 
-## Sampling defaults, measured
+## Sampling
 
-A 135M model has two bad habits in chat: it rambles, and it falls into loops ("a source of strength, a source of
-comfort, a source of joy…"). The usual fixes break other things. A repetition penalty strong enough to stop the
-rambling (1.2) wrecks arithmetic, because every digit is its own token here and "100 + 200 = 300" *has* to reuse
-the digits of the question. And DRY, the anti-loop sampler, read the echoed "100 + 20" as a loop and pushed the
-next "0" down: "100 + 201 = 301".
+A 135M model falls into loops easily ("a source of strength, a source of comfort, a source of joy…"). The page's
+default preset, **Focused**, picks the model's favourite token except when DRY, the anti-loop sampler, sees a phrase
+starting to repeat; then it pushes down the token that would continue the repeat, harder the longer the repeat is.
 
-So the penalties apply **only to tokens containing a letter** (numbers, operators and punctuation are exempt: loops
-are made of words), and a **wrap-up bias** raises the logit of `<|im_end|>` by 0.05 per token once a reply passes
-40 tokens. The page offers these as presets, ordered by how often the sampler overrules the model's own favourite
-token. `cargo run --release --example chat_tuning` produced this (10 arithmetic questions, 5 factual ones and 6 open
-prompts like "What is love?", 10 seeds each, open replies capped at 300 tokens):
-
-| Preset | Arithmetic | Facts | Open replies: median length | ended on their own | looped | overruled |
-|---|---|---|---|---|---|---|
-| Greedy (the model alone) | 70% | 100% | 300 | 33% | 50 / 60 | 0% |
-| **Focused (default): greedy + DRY 0.8 + wrap-up** | **70%** | **100%** | **173** | **100%** | **0 / 60** | **3%** |
-| Model card: T 0.2, top-p 0.9 | 59% | 100% | 300 | 36% | 37 / 60 | 5% |
-| Balanced: model card + DRY + rep 1.1 + wrap-up | 65% | 100% | 188 | 100% | 0 / 60 | 22% |
-| Creative: T 0.8, top-p 0.95, DRY + rep 1.1 + wrap-up | 60% | 78% | 172 | 100% | 0 / 60 | 39% |
-| Model's own odds: T 1 | 46% | 80% | 250 | 61% | 1 / 60 | 48% |
-
-Focused does as well as greedy on questions with one right answer and still never loops, because it only steps in
-when a phrase starts repeating. Its one cost: the same question always gets the same answer. A repetition penalty,
-even 1.1, overrules the model far more often (on common words like "is"), and 1.2 on every token drops arithmetic
-to 13%. In chat, hovering a reply token shows both the model's odds and the sampler's.
-
-The arithmetic ceiling is the model's, not the engine's: the golden tests check that greedy chat replies, including
-"What is 45 - 17?" (to which HF's own `transformers` answers 32), match `transformers` token for token. Every knob is
-adjustable in the UI, and the Next token view marks the tokens DRY pushed down (↺).
+The penalties apply **only to tokens containing a letter**: numbers, operators and punctuation are exempt, because
+loops are made of words, while "100 + 200 = 300" *has* to reuse the digits of the question. The Sampler menu has
+other presets (greedy, the model card's, more random ones), and the Next token view marks the tokens DRY pushed
+down (↺).
 
 ## How a token flows through the model
 
@@ -150,15 +117,14 @@ engine/          the inference engine (library + `smol` CLI)
     hooks.rs         the observe / intervene interface
     sampler.rs       temperature, top-k, top-p, repetition penalty, DRY
     generate.rs      prefill + decode loop, streaming UTF-8
-    chat.rs          ChatML template, multi-turn conversations
-    trace.rs         records a session by position; the logit lens
-    flow.rs          one position through one layer in full, and where each write came from
+    trace.rs         records the residual stream of a session by position
+    walk.rs          one position through one layer in full, for Step by step
     session.rs       the visualizer's API: method + JSON args → JSON
   tests/           golden tests against HF, session API tests
 wasm/            the engine compiled for the browser (raw ABI, no wasm-bindgen)
 viz/
   src/main.rs      dev server (axum): static files, /models, optional native API
-  web/             the static site: app.js (views), flow.js (the Flow tab), walk.js and walk-info.js (Step by step and its explanations), worker.js (engine in a Web Worker)
+  web/             the static site: app.js (page, Next token), walk.js and walk-info.js (Step by step and its explanations), glossary.js, worker.js (engine in a Web Worker)
 reference/       Python scripts that produce the golden data from `transformers`
 scripts/         build-web.sh, test-wasm.mjs
 ```
@@ -183,10 +149,8 @@ python -m venv .venv && .venv/bin/pip install torch transformers tokenizers safe
 - What the KV cache buys you, and what it costs in bytes per position (46 KB here).
 - Why grouped-query attention exists: 9 query heads share 3 key/value heads, a 3× smaller cache.
 - Attention sinks: many heads park their attention on the first token when they have nothing to do.
-- How the answer emerges in the middle layers (logit lens), and which heads matter (ablation).
+- What RoPE does to a query and a key, and why position 0 comes out unchanged.
 - What temperature, top-p and penalties actually do to a distribution, and why a tiny model loops without them.
-- Where an answer comes from: in "The capital of France is Paris. The capital of Germany is", layer 23's attention copies
-  " Germany" into the last position, and that one write lifts the logit of " Berlin" by more than 5 (Flow tab).
 
 ## Credits
 
